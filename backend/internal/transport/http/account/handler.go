@@ -1,6 +1,7 @@
 package account
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -133,6 +135,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
+	router.POST("/accounts/export", h.exportSelectedCredentials)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -151,11 +154,13 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/reset-quota", h.resetAllBuildQuota)
 	router.POST("/accounts/refresh-tokens", h.refreshAllTokens)
 	router.POST("/accounts/cleanup", h.cleanup)
+	router.POST("/accounts/cleanup-preview", h.cleanupPreview)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
 	router.POST("/accounts/batch/reset-quota", h.batchResetQuota)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.PATCH("/accounts/batch", h.batchUpdate)
+	router.POST("/accounts/deletion-preview", h.previewDeletion)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
 	router.DELETE("/accounts/:id", h.delete)
@@ -186,13 +191,26 @@ type batchUpdateRequest struct {
 }
 
 type batchDeleteRequest struct {
+	IDs                 []string `json:"ids" binding:"required"`
+	Provider            string   `json:"provider" binding:"required"`
+	LinkedDeleteTargets []string `json:"linkedDeleteTargets"`
+}
+
+type credentialExportRequest struct {
 	IDs      []string `json:"ids" binding:"required"`
 	Provider string   `json:"provider" binding:"required"`
 }
 
+type deletionPreviewRequest struct {
+	IDs                 []string `json:"ids" binding:"required"`
+	Provider            string   `json:"provider" binding:"required"`
+	LinkedDeleteTargets []string `json:"linkedDeleteTargets"`
+}
+
 type accountCleanupRequest struct {
-	Provider string                     `json:"provider" binding:"required"`
-	Statuses []accountapp.CleanupStatus `json:"statuses" binding:"required"`
+	Provider            string                     `json:"provider" binding:"required"`
+	Statuses            []accountapp.CleanupStatus `json:"statuses" binding:"required"`
+	LinkedDeleteTargets []string                   `json:"linkedDeleteTargets"`
 }
 
 type buildConversionRequest struct {
@@ -260,7 +278,10 @@ type accountResponse struct {
 	RefreshDueAt               *time.Time              `json:"refreshDueAt,omitempty"`
 	LastRefreshAt              *time.Time              `json:"lastRefreshAt,omitempty"`
 	RefreshFailures            int                     `json:"refreshFailureCount"`
+	LastRefreshErrorStatus     int                     `json:"lastRefreshErrorStatus,omitempty"`
 	LastRefreshError           string                  `json:"lastRefreshErrorCode,omitempty"`
+	LastRefreshErrorMessage    string                  `json:"lastRefreshErrorMessage,omitempty"`
+	LastRefreshErrorResponse   string                  `json:"lastRefreshErrorResponse,omitempty"`
 	Priority                   int                     `json:"priority"`
 	MaxConcurrent              int                     `json:"maxConcurrent"`
 	MinimumRemaining           float64                 `json:"minimumRemaining"`
@@ -420,10 +441,7 @@ func (h *Handler) batchUpdate(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
 		return
 	}
-	if !h.validateProviderIDs(c, ids, request.Provider) {
-		return
-	}
-	updated, err := h.service.BatchUpdate(c.Request.Context(), ids, accountapp.UpdateInput{Enabled: request.Enabled, Priority: request.Priority, MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining})
+	updated, err := h.service.BatchUpdate(c.Request.Context(), accountdomain.Provider(request.Provider), ids, accountapp.UpdateInput{Enabled: request.Enabled, Priority: request.Priority, MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining})
 	if err != nil {
 		h.writeServiceError(c, "accountBatchUpdateFailed", err, http.StatusInternalServerError, "批量更新账号失败")
 		return
@@ -445,12 +463,52 @@ func (h *Handler) batchDelete(c *gin.Context) {
 	if !h.validateProviderIDs(c, ids, request.Provider) {
 		return
 	}
-	deleted, err := h.service.BatchDelete(c.Request.Context(), ids)
+	targets, err := parseLinkedDeleteTargets(request.LinkedDeleteTargets)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidLinkedDeleteTargets", err.Error())
+		return
+	}
+	result, err := h.service.BatchDeleteWithLinked(c.Request.Context(), accountdomain.Provider(request.Provider), ids, targets)
 	if err != nil {
 		h.writeServiceError(c, "accountBatchDeleteFailed", err, http.StatusInternalServerError, "批量删除账号失败")
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
+	response.Success(c, http.StatusOK, newAccountDeleteResponse(result))
+}
+
+func (h *Handler) previewDeletion(c *gin.Context) {
+	var request deletionPreviewRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
+		return
+	}
+	targets, err := parseLinkedDeleteTargets(request.LinkedDeleteTargets)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidLinkedDeleteTargets", err.Error())
+		return
+	}
+	resolution, err := h.service.PreviewLinkedDelete(c.Request.Context(), accountdomain.Provider(request.Provider), ids, targets)
+	if err != nil {
+		h.writeServiceError(c, "accountDeletionPreviewFailed", err, http.StatusInternalServerError, "预览删除账号失败")
+		return
+	}
+	linked := gin.H{}
+	for provider, count := range resolution.LinkedByProvider {
+		linked[string(provider)] = count
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"rootCount":        len(resolution.RootIDs),
+		"linkedByProvider": linked,
+		"total":            len(resolution.FinalIDs),
+	})
 }
 
 func (h *Handler) batchRefreshBilling(c *gin.Context) {
@@ -517,12 +575,60 @@ func (h *Handler) cleanup(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	deleted, err := h.service.CleanupAccounts(c.Request.Context(), accountdomain.Provider(request.Provider), request.Statuses)
+	targets, err := parseLinkedDeleteTargets(request.LinkedDeleteTargets)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidLinkedDeleteTargets", err.Error())
+		return
+	}
+	result, err := h.service.CleanupAccounts(c.Request.Context(), accountdomain.Provider(request.Provider), request.Statuses, targets)
 	if err != nil {
 		h.writeServiceError(c, "accountCleanupFailed", err, http.StatusInternalServerError, "清理账号失败")
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
+	byProvider := gin.H{}
+	for provider, count := range result.DeletedByProvider {
+		byProvider[string(provider)] = count
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"deleted":           result.Deleted,
+		"rootsDeleted":      result.RootsDeleted,
+		"linkedDeleted":     result.LinkedDeleted,
+		"skipped":           result.Skipped,
+		"deletedByProvider": byProvider,
+	})
+}
+
+// cleanupPreview returns root and linked-peer counts for the cleanup dialog.
+func (h *Handler) cleanupPreview(c *gin.Context) {
+	var request accountCleanupRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	targets, err := parseLinkedDeleteTargets(request.LinkedDeleteTargets)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidLinkedDeleteTargets", err.Error())
+		return
+	}
+	preview, err := h.service.PreviewCleanup(c.Request.Context(), accountdomain.Provider(request.Provider), request.Statuses, targets)
+	if err != nil {
+		h.writeServiceError(c, "accountCleanupPreviewFailed", err, http.StatusInternalServerError, "预览清理账号失败")
+		return
+	}
+	rootsByStatus := gin.H{}
+	for status, count := range preview.RootsByStatus {
+		rootsByStatus[status] = count
+	}
+	linked := gin.H{}
+	for provider, count := range preview.LinkedByProvider {
+		linked[string(provider)] = count
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"rootsByStatus":    rootsByStatus,
+		"rootCount":        preview.RootCount,
+		"linkedByProvider": linked,
+		"total":            preview.Total,
+	})
 }
 
 func (h *Handler) batchRefreshQuotas(c *gin.Context) {
@@ -982,14 +1088,70 @@ func (h *Handler) refreshWebQuota(c *gin.Context) {
 
 func (h *Handler) exportCredentials(c *gin.Context) {
 	providerValue := accountdomain.Provider(c.DefaultQuery("provider", string(accountdomain.ProviderBuild)))
+	if limitText, pagedExport := c.GetQuery("limit"); pagedExport {
+		if _, usesOffset := c.GetQuery("offset"); usesOffset {
+			response.Error(c, http.StatusBadRequest, "accountExportFailed", "分批导出不支持 offset，请使用服务端返回的 afterId")
+			return
+		}
+		limit, err := strconv.Atoi(strings.TrimSpace(limitText))
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "accountExportFailed", "导出数量必须为整数")
+			return
+		}
+		afterID, err := strconv.ParseUint(strings.TrimSpace(c.DefaultQuery("afterId", "0")), 10, 64)
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "accountExportFailed", "导出游标必须为非负整数")
+			return
+		}
+		snapshotMaxID, err := strconv.ParseUint(strings.TrimSpace(c.DefaultQuery("snapshotMaxId", "0")), 10, 64)
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "accountExportFailed", "导出快照上界必须为非负整数")
+			return
+		}
+		result, exportErr := h.service.ExportProviderCredentialsCursor(c.Request.Context(), providerValue, afterID, snapshotMaxID, limit)
+		if exportErr != nil {
+			h.writeServiceError(c, "accountExportFailed", exportErr, http.StatusInternalServerError, "导出账号失败")
+			return
+		}
+		c.Header("X-Export-Next-ID", strconv.FormatUint(result.NextID, 10))
+		c.Header("X-Export-Snapshot-Max-ID", strconv.FormatUint(result.SnapshotMaxID, 10))
+		c.Header("X-Export-Has-More", strconv.FormatBool(result.HasMore))
+		h.writeCredentialExport(c, providerValue, result.ExportResult)
+		return
+	}
 	result, err := h.service.ExportProviderCredentials(c.Request.Context(), providerValue)
 	if err != nil {
 		h.writeServiceError(c, "accountExportFailed", err, http.StatusInternalServerError, "导出账号失败")
 		return
 	}
+	h.writeCredentialExport(c, providerValue, result)
+}
+
+func (h *Handler) exportSelectedCredentials(c *gin.Context) {
+	var request credentialExportRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	providerValue := accountdomain.Provider(request.Provider)
+	result, err := h.service.ExportProviderCredentialsByIDs(c.Request.Context(), providerValue, ids)
+	if err != nil {
+		h.writeServiceError(c, "accountExportFailed", err, http.StatusInternalServerError, "导出账号失败")
+		return
+	}
+	h.writeCredentialExport(c, providerValue, result)
+}
+
+func (h *Handler) writeCredentialExport(c *gin.Context, providerValue accountdomain.Provider, result accountapp.ExportResult) {
 	filename := "grok2api-" + string(providerValue) + "-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
 	c.Header("Cache-Control", "no-store")
 	c.Header("Pragma", "no-cache")
+	c.Header("Access-Control-Expose-Headers", "Content-Disposition, X-Exported-Accounts, X-Export-Next-ID, X-Export-Snapshot-Max-ID, X-Export-Has-More")
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("X-Exported-Accounts", strconv.Itoa(result.Count))
@@ -1037,11 +1199,80 @@ func (h *Handler) delete(c *gin.Context) {
 	if !ok {
 		return
 	}
+	var request struct {
+		Provider            string   `json:"provider"`
+		LinkedDeleteTargets []string `json:"linkedDeleteTargets"`
+	}
+	// Empty body = legacy single-account delete. Non-empty body must bind cleanly
+	// so a truncated/malformed linked-delete request cannot silently drop targets.
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &request); err != nil {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+			return
+		}
+	}
+	targets, err := parseLinkedDeleteTargets(request.LinkedDeleteTargets)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidLinkedDeleteTargets", err.Error())
+		return
+	}
+	if len(targets) > 0 {
+		if request.Provider == "" {
+			response.Error(c, http.StatusBadRequest, "invalidProvider", "删除关联账号时必须指定 provider")
+			return
+		}
+		result, err := h.service.DeleteWithLinked(c.Request.Context(), accountdomain.Provider(request.Provider), id, targets)
+		if err != nil {
+			h.writeServiceError(c, "accountDeleteFailed", err, http.StatusInternalServerError, "删除账号失败")
+			return
+		}
+		response.Success(c, http.StatusOK, newAccountDeleteResponse(result))
+		return
+	}
 	if err := h.service.Delete(c.Request.Context(), id); err != nil {
 		h.writeServiceError(c, "accountDeleteFailed", err, http.StatusInternalServerError, "删除账号失败")
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"deleted": true})
+}
+
+func parseLinkedDeleteTargets(values []string) ([]accountdomain.Provider, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([]accountdomain.Provider, 0, len(values))
+	seen := map[accountdomain.Provider]struct{}{}
+	for _, value := range values {
+		provider := accountdomain.Provider(strings.TrimSpace(value))
+		if !provider.IsValid() {
+			return nil, fmt.Errorf("关联删除目标无效")
+		}
+		if _, ok := seen[provider]; ok {
+			continue
+		}
+		seen[provider] = struct{}{}
+		out = append(out, provider)
+	}
+	return out, nil
+}
+
+func newAccountDeleteResponse(result accountapp.AccountDeleteResult) gin.H {
+	byProvider := gin.H{}
+	for provider, count := range result.DeletedByProvider {
+		byProvider[string(provider)] = count
+	}
+	return gin.H{
+		"deleted":           result.Deleted,
+		"rootsDeleted":      result.RootsDeleted,
+		"linkedDeleted":     result.LinkedDeleted,
+		"skipped":           result.Skipped,
+		"deletedByProvider": byProvider,
+	}
 }
 
 // writeServiceError 仅暴露明确的账号业务错误，未知内部错误使用稳定文案。
@@ -1053,6 +1284,8 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error, fall
 		response.Error(c, http.StatusBadRequest, "accountExportLimitExceeded", err.Error())
 	case errors.Is(err, accountapp.ErrInvalidInput), errors.Is(err, accountapp.ErrInvalidImport):
 		response.Error(c, http.StatusBadRequest, code, err.Error())
+	case errors.Is(err, accountapp.ErrAccountPoolMismatch):
+		response.Error(c, http.StatusConflict, "accountPoolMismatch", err.Error())
 	case errors.Is(err, accountapp.ErrConflict):
 		response.Error(c, http.StatusConflict, code, err.Error())
 	case errors.Is(err, accountapp.ErrNotFound):
@@ -1185,7 +1418,7 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		WebTierSyncedAt: c.WebTierSyncedAt, WebNSFWEnabledAt: c.WebNSFWEnabledAt, WebTermsAcceptedAt: c.WebTermsAcceptedAt, Name: c.Name, Email: c.Email, UserID: c.UserID, TeamID: c.TeamID,
 		Enabled: c.Enabled, AuthStatus: string(c.AuthStatus), Refreshable: c.EncryptedRefreshToken != "",
 		RefreshDueAt: c.RefreshDueAt, LastRefreshAt: c.LastRefreshAt,
-		RefreshFailures: c.RefreshFailureCount, LastRefreshError: c.LastRefreshErrorCode,
+		RefreshFailures: c.RefreshFailureCount, LastRefreshErrorStatus: c.LastRefreshErrorStatus, LastRefreshError: c.LastRefreshErrorCode, LastRefreshErrorMessage: c.LastRefreshErrorMessage, LastRefreshErrorResponse: c.LastRefreshErrorResponse,
 		Priority: c.Priority, MaxConcurrent: c.MaxConcurrent, MinimumRemaining: c.MinimumRemaining,
 		FailureCount: c.FailureCount, CooldownUntil: c.CooldownUntil, LastError: c.LastError,
 		LastUsedAt: c.LastUsedAt, LinkedAccountID: c.LinkedAccountID, LinkedName: c.LinkedAccountName, LinkedProvider: string(c.LinkedProvider),

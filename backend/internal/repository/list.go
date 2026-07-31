@@ -75,11 +75,14 @@ type AccountListFilter struct {
 	Refreshable *bool
 	// Agreement filters grok_web accounts by NSFW and current terms acceptance.
 	Agreement string
-	// Association filters grok_web accounts by Build and Console links.
+	// Association filters accounts by link-table bindings: grok_web supports
+	// build/console/all values; grok_build and grok_console support webLinked/webUnlinked.
 	Association string
 	AccountIDs  []uint64
 	RestrictIDs bool
 	ExcludeIDs  []uint64
+	AfterID     uint64
+	ThroughID   uint64
 	Now         time.Time
 }
 
@@ -100,8 +103,11 @@ type AccountSummary struct {
 }
 
 type ModelListFilter struct {
-	Provider string
-	Enabled  *bool
+	Provider    string
+	Providers   []string
+	Tiers       []string
+	Enabled     *bool
+	ActiveScope bool
 }
 
 type ModelListQuery struct {

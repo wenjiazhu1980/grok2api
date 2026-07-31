@@ -406,6 +406,185 @@ func TestEgressOperationsBatchDeleteClearsAccountBindings(t *testing.T) {
 	}
 }
 
+func TestEgressOperationsBatchUpdatesEnabledState(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	first := createHealthyEgressNode(t, ctx, nodes, cipher, "batch-enable-first", 0)
+	second := createHealthyEgressNode(t, ctx, nodes, cipher, "batch-enable-second", 0)
+	second.Enabled = false
+	if _, err := nodes.UpdateEgressNode(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	service := egressapp.NewService(nodes, cipher, "test-browser")
+	updated, err := service.UpdateManyEnabled(ctx, []uint64{first.ID, second.ID, first.ID}, false)
+	if err != nil || updated != 1 {
+		t.Fatalf("disable updated = %d, err = %v", updated, err)
+	}
+	updated, err = service.UpdateManyEnabled(ctx, []uint64{first.ID, second.ID}, true)
+	if err != nil || updated != 2 {
+		t.Fatalf("enable updated = %d, err = %v", updated, err)
+	}
+	for _, id := range []uint64{first.ID, second.ID} {
+		stored, err := nodes.GetEgressNode(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored.Enabled {
+			t.Fatalf("node %d remained disabled", id)
+		}
+	}
+}
+
+func TestEgressOperationsBatchDisableRejectsFixedFallback(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	fallbackNode := createHealthyEgressNode(t, ctx, nodes, cipher, "batch-fallback", 0)
+	otherNode := createHealthyEgressNode(t, ctx, nodes, cipher, "batch-other", 0)
+	service := egressapp.NewService(nodes, cipher, "test-browser")
+	if _, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
+		ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
+		Fallbacks: map[egress.Scope]egressapp.FallbackConfigInput{
+			egress.ScopeBuild: {Mode: egress.FallbackModeFixed, NodeID: fallbackNode.ID},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.UpdateManyEnabled(ctx, []uint64{otherNode.ID, fallbackNode.ID}, false); err == nil {
+		t.Fatal("expected fixed fallback disable to fail")
+	}
+	for _, id := range []uint64{fallbackNode.ID, otherNode.ID} {
+		stored, err := nodes.GetEgressNode(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored.Enabled {
+			t.Fatalf("node %d changed despite rejected batch", id)
+		}
+	}
+}
+
+func TestEgressOperationsConfigRechecksFallbackNodeInsideTransaction(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	fallbackNode := createHealthyEgressNode(t, ctx, nodes, cipher, "transaction-fallback", 0)
+
+	if _, err := nodes.UpdateEgressNodesEnabled(ctx, []uint64{fallbackNode.ID}, false); err != nil {
+		t.Fatal(err)
+	}
+	config := egress.DefaultOperationsConfig()
+	config.Fallbacks[egress.ScopeBuild] = egress.FallbackConfig{Mode: egress.FallbackModeFixed, NodeID: fallbackNode.ID}
+	config.UpdatedAt = time.Now().UTC()
+	if _, err := nodes.SaveEgressOperationsConfig(ctx, config); !errors.Is(err, repository.ErrEgressFallbackInUse) {
+		t.Fatalf("disabled fallback save error = %v", err)
+	}
+	stored, err := nodes.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback := stored.FallbackFor(egress.ScopeBuild); fallback.Mode != egress.FallbackModeNone || fallback.NodeID != 0 {
+		t.Fatalf("rejected fallback was persisted: %#v", fallback)
+	}
+}
+
+func TestEgressOperationsCleanupDeletesOnlyDualStackUnhealthyNodes(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+
+	source, err := nodes.CreateEgressSource(ctx, egress.SubscriptionSource{
+		Name: "cleanup-source", Scope: egress.ScopeBuild, Enabled: true, RefreshIntervalSeconds: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual := createHealthyEgressNode(t, ctx, nodes, cipher, "cleanup-manual", 0)
+	managed := createHealthyEgressNode(t, ctx, nodes, cipher, "cleanup-managed", 0)
+	managed.SourceID = source.ID
+	managed.SourceKey = "managed"
+	if managed, err = nodes.UpdateEgressNode(ctx, managed); err != nil {
+		t.Fatal(err)
+	}
+	v4Healthy := createHealthyEgressNode(t, ctx, nodes, cipher, "cleanup-v4-healthy", 0)
+	v6Healthy := createHealthyEgressNode(t, ctx, nodes, cipher, "cleanup-v6-healthy", 0)
+	untested := createHealthyEgressNode(t, ctx, nodes, cipher, "cleanup-untested", 0)
+
+	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
+	if _, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
+		ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
+		Fallbacks: map[egress.Scope]egressapp.FallbackConfigInput{
+			egress.ScopeBuild: {Mode: egress.FallbackModeFixed, NodeID: manual.ID},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	setEgressProbeFamilies(t, ctx, nodes, manual, egress.ProbeStatusUnhealthy, egress.ProbeStatusUnhealthy)
+	setEgressProbeFamilies(t, ctx, nodes, managed, egress.ProbeStatusUnhealthy, egress.ProbeStatusUnhealthy)
+	setEgressProbeFamilies(t, ctx, nodes, v4Healthy, egress.ProbeStatusHealthy, egress.ProbeStatusUnhealthy)
+	setEgressProbeFamilies(t, ctx, nodes, v6Healthy, egress.ProbeStatusUnhealthy, egress.ProbeStatusHealthy)
+	setEgressProbeFamilies(t, ctx, nodes, untested, egress.ProbeStatusUnknown, egress.ProbeStatusUnknown)
+
+	firstAccount := createEgressOperationsAccount(t, ctx, accounts, "cleanup-manual-account")
+	secondAccount := createEgressOperationsAccount(t, ctx, accounts, "cleanup-managed-account")
+	if _, err := accounts.UpdateEgressBindings(ctx, account.ProviderBuild, []uint64{firstAccount.ID}, &manual.ID, account.EgressAssignmentManual, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.UpdateEgressBindings(ctx, account.ProviderBuild, []uint64{secondAccount.ID}, &managed.ID, account.EgressAssignmentAuto, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := service.PreviewUnhealthyCleanup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Nodes != 2 || preview.BoundAccounts != 2 || preview.SubscriptionManaged != 1 {
+		t.Fatalf("cleanup preview = %#v", preview)
+	}
+	deleted, err := service.DeleteUnhealthy(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d", deleted)
+	}
+	for _, id := range []uint64{manual.ID, managed.ID} {
+		if _, err := nodes.GetEgressNode(ctx, id); !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("dual-stack unhealthy node %d still exists: %v", id, err)
+		}
+	}
+	for _, id := range []uint64{v4Healthy.ID, v6Healthy.ID, untested.ID} {
+		if _, err := nodes.GetEgressNode(ctx, id); err != nil {
+			t.Fatalf("preserved node %d: %v", id, err)
+		}
+	}
+	for _, value := range []account.Credential{firstAccount, secondAccount} {
+		stored, err := accounts.Get(ctx, value.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.EgressNodeID != 0 || stored.EgressAssignmentMode != "" || stored.EgressAssignedAt != nil {
+			t.Fatalf("account binding not cleared: %#v", stored)
+		}
+	}
+	config, err := nodes.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback := config.FallbackFor(egress.ScopeBuild); fallback.Mode != egress.FallbackModeNone || fallback.NodeID != 0 {
+		t.Fatalf("cleanup fallback reference = %#v", fallback)
+	}
+}
+
 func TestEgressOperationsRejectsManualBindingsToDisabledOrDirectNodes(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
@@ -442,6 +621,9 @@ func TestEgressOperationsPersistsProbeResult(t *testing.T) {
 	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
 	service.SetNodeProber(egressProbeStub{result: egress.ProbeResult{
 		Status: egress.ProbeStatusHealthy, TestedAt: probedAt, LatencyMS: 42, ExitIP: "1.1.1.1",
+		Provider: egress.ProbeProviderCloudflare,
+		IPv4:     egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, LatencyMS: 40, ExitIP: "1.1.1.1"},
+		IPv6:     egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, LatencyMS: 42, ExitIP: "2606:4700:4700::1111"},
 	}})
 
 	result, err := service.TestNode(ctx, node.ID)
@@ -455,8 +637,60 @@ func TestEgressOperationsPersistsProbeResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.ProbeStatus != egress.ProbeStatusHealthy || stored.ProbeLatencyMS != 42 || stored.ExitIP != "1.1.1.1" || stored.LastProbedAt == nil {
+	if stored.ProbeStatus != egress.ProbeStatusHealthy || stored.ProbeProvider != egress.ProbeProviderCloudflare || stored.ProbeLatencyMS != 42 || stored.ExitIP != "1.1.1.1" || stored.LastProbedAt == nil {
 		t.Fatalf("stored probe = %#v", stored)
+	}
+	if stored.IPv4Probe.ExitIP != "1.1.1.1" || stored.IPv6Probe.ExitIP != "2606:4700:4700::1111" || stored.IPv6Probe.Status != egress.ProbeStatusHealthy {
+		t.Fatalf("stored family probes = ipv4:%#v ipv6:%#v", stored.IPv4Probe, stored.IPv6Probe)
+	}
+	updatedConfig, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
+		ProbeProvider: egress.ProbeProviderIPInfo, ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
+	})
+	if err != nil || updatedConfig.ProbeProvider != egress.ProbeProviderIPInfo {
+		t.Fatalf("updated probe provider = %#v, err=%v", updatedConfig, err)
+	}
+	stored, err = nodes.GetEgressNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ProbeProvider != egress.ProbeProviderCloudflare {
+		t.Fatalf("stored result provider changed with future probe configuration: %q", stored.ProbeProvider)
+	}
+}
+
+func TestEgressOperationsDiscardsProbeAfterProxyConfigurationChanges(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	node := createHealthyEgressNode(t, ctx, nodes, cipher, "probe-stale", 0)
+	replacementProxy, err := cipher.Encrypt("http://replacement.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probedAt := time.Now().UTC().Truncate(time.Millisecond)
+	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
+	service.SetNodeProber(mutatingEgressProbeStub{
+		repository:  nodes,
+		replacement: replacementProxy,
+		result: egress.ProbeResult{
+			Status: egress.ProbeStatusHealthy, TestedAt: probedAt, LatencyMS: 10, ExitIP: "198.51.100.20", Provider: egress.ProbeProviderCloudflare,
+			IPv4: egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, LatencyMS: 10, ExitIP: "198.51.100.20"},
+			IPv6: egress.ProbeFamilyResult{Status: egress.ProbeStatusUnhealthy, TestedAt: probedAt, LatencyMS: 10, Error: "代理连接失败"},
+		},
+	})
+
+	_, err = service.TestNode(ctx, node.ID)
+	if !errors.Is(err, egressapp.ErrProbeStale) {
+		t.Fatalf("stale probe error = %v", err)
+	}
+	stored, err := nodes.GetEgressNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EncryptedProxyURL != replacementProxy || stored.ProbeStatus != egress.ProbeStatusUnknown || stored.ProbeProvider != "" || stored.IPv4Probe.Status != egress.ProbeStatusUnknown {
+		t.Fatalf("stale probe overwrote edited node: %#v", stored)
 	}
 }
 
@@ -586,7 +820,7 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	service := egressapp.NewService(nodes, cipher, "test-browser")
 
 	saved, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
-		ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
+		ProbeProvider: egress.ProbeProviderCloudflare, ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
 		Fallbacks: map[egress.Scope]egressapp.FallbackConfigInput{
 			egress.ScopeBuild: {Mode: egress.FallbackModeFixed, NodeID: fixed.ID},
 			egress.ScopeWeb:   {Mode: egress.FallbackModeDirect},
@@ -597,6 +831,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	}
 	if fallback := saved.FallbackFor(egress.ScopeBuild); fallback.Mode != egress.FallbackModeFixed || fallback.NodeID != fixed.ID {
 		t.Fatalf("saved Build fallback = %#v", fallback)
+	}
+	if saved.ProbeProvider != egress.ProbeProviderCloudflare {
+		t.Fatalf("saved probe provider = %q", saved.ProbeProvider)
 	}
 	if fallback := saved.FallbackFor(egress.ScopeWeb); fallback.Mode != egress.FallbackModeDirect || fallback.NodeID != 0 {
 		t.Fatalf("saved Web fallback = %#v", fallback)
@@ -614,6 +851,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	}
 	if fallback := stored.FallbackFor(egress.ScopeWeb); fallback.Mode != egress.FallbackModeDirect || fallback.NodeID != 0 {
 		t.Fatalf("stored Web fallback = %#v", fallback)
+	}
+	if stored.ProbeProvider != egress.ProbeProviderCloudflare {
+		t.Fatalf("stored probe provider = %q", stored.ProbeProvider)
 	}
 	updated, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
 		ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
@@ -749,7 +989,29 @@ type egressProbeStub struct {
 	err    error
 }
 
-func (stub egressProbeStub) ProbeEgressNode(context.Context, uint64) (egress.ProbeResult, error) {
+type mutatingEgressProbeStub struct {
+	repository  *EgressRepository
+	replacement string
+	result      egress.ProbeResult
+}
+
+func (stub mutatingEgressProbeStub) ProbeEgressNode(ctx context.Context, node egress.Node) (egress.ProbeResult, error) {
+	node.EncryptedProxyURL = stub.replacement
+	node.ProbeStatus = egress.ProbeStatusUnknown
+	node.LastProbedAt = nil
+	node.ProbeLatencyMS = 0
+	node.ExitIP = ""
+	node.ProbeError = ""
+	node.ProbeProvider = ""
+	node.IPv4Probe = egress.ProbeFamilyResult{Status: egress.ProbeStatusUnknown}
+	node.IPv6Probe = egress.ProbeFamilyResult{Status: egress.ProbeStatusUnknown}
+	if _, err := stub.repository.UpdateEgressNode(ctx, node); err != nil {
+		return egress.ProbeResult{}, err
+	}
+	return stub.result, nil
+}
+
+func (stub egressProbeStub) ProbeEgressNode(context.Context, egress.Node) (egress.ProbeResult, error) {
 	return stub.result, stub.err
 }
 
@@ -781,6 +1043,18 @@ func createHealthyEgressNodeForScope(t *testing.T, ctx context.Context, reposito
 		t.Fatal(err)
 	}
 	return created
+}
+
+func setEgressProbeFamilies(t *testing.T, ctx context.Context, repository *EgressRepository, node egress.Node, ipv4, ipv6 egress.ProbeStatus) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := repository.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, egress.ProbeResult{
+		Status: egress.ProbeStatusUnhealthy, TestedAt: now, Error: "probe failed",
+		IPv4: egress.ProbeFamilyResult{Status: ipv4, TestedAt: now},
+		IPv6: egress.ProbeFamilyResult{Status: ipv6, TestedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func createEgressOperationsAccount(t *testing.T, ctx context.Context, repository *AccountRepository, sourceKey string) account.Credential {

@@ -17,8 +17,10 @@ import (
 
 var (
 	ErrInvalidInput         = errors.New("代理节点参数无效")
+	ErrInvalidFilter        = errors.New("出口代理筛选条件无效")
 	ErrInvalidSort          = errors.New("代理节点排序条件无效")
 	ErrNotFound             = errors.New("代理节点不存在")
+	ErrProbeStale           = errors.New("代理配置在探测期间已更新，请重新测试")
 	ErrClearanceUnavailable = errors.New("Clearance 刷新不可用")
 )
 
@@ -42,8 +44,21 @@ type Input struct {
 	ClearCookies      bool
 }
 
+type ListFilter struct {
+	Scope       domain.Scope
+	Enabled     string
+	ProbeStatus string
+	Assignment  string
+	Sort        repository.SortQuery
+}
+
+type ServiceRepository interface {
+	repository.EgressRepository
+	repository.EgressNodePageRepository
+}
+
 type Service struct {
-	repository        repository.EgressRepository
+	repository        ServiceRepository
 	accounts          AccountBindingRepository
 	operations        OperationsRepository
 	cipher            *security.Cipher
@@ -71,10 +86,20 @@ type AssignmentResult struct {
 	Assigned int
 }
 
+type UnhealthyCleanupPreview struct {
+	Nodes               int64
+	BoundAccounts       int64
+	SubscriptionManaged int64
+}
+
 // BatchNodeDeleter is optional so lightweight repository adapters only need
 // the single-node contract unless they can provide an atomic bulk operation.
 type BatchNodeDeleter interface {
 	DeleteEgressNodes(context.Context, []uint64) (int, error)
+}
+
+type BatchNodeEnabledUpdater interface {
+	UpdateEgressNodesEnabled(context.Context, []uint64, bool) (int, error)
 }
 
 type ClearanceManager interface {
@@ -82,7 +107,11 @@ type ClearanceManager interface {
 	ForgetClearance(uint64)
 }
 
-func NewService(repository repository.EgressRepository, cipher *security.Cipher, browserUA string, accounts ...AccountBindingRepository) *Service {
+type BatchClearanceManager interface {
+	ForgetClearances([]uint64)
+}
+
+func NewService(repository ServiceRepository, cipher *security.Cipher, browserUA string, accounts ...AccountBindingRepository) *Service {
 	service := &Service{repository: repository, cipher: cipher, browserUA: strings.TrimSpace(browserUA)}
 	if operations, ok := repository.(OperationsRepository); ok {
 		service.operations = operations
@@ -114,7 +143,37 @@ func (s *Service) DefaultUserAgents() map[string]string {
 	}
 }
 
-func (s *Service) List(ctx context.Context, scope domain.Scope, sort repository.SortQuery) ([]domain.PublicNode, error) {
+func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]domain.PublicNode, int64, error) {
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
+	if !validListScope(filter.Scope) || !validListValue(filter.Enabled, "enabled", "disabled") ||
+		!validListValue(filter.ProbeStatus, string(domain.ProbeStatusHealthy), string(domain.ProbeStatusUnhealthy), string(domain.ProbeStatusUnknown)) ||
+		!validListValue(filter.Assignment, "bound", "unbound") {
+		return nil, 0, ErrInvalidFilter
+	}
+	if !repository.IsValidSort(filter.Sort, "name", "scope", "proxy", "clearance", "health") {
+		return nil, 0, ErrInvalidSort
+	}
+	var enabled *bool
+	if filter.Enabled != "" {
+		value := filter.Enabled == "enabled"
+		enabled = &value
+	}
+	values, total, err := s.repository.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search), Sort: filter.Sort},
+		Filter: repository.EgressNodeListFilter{
+			Scope: filter.Scope, Enabled: enabled, ProbeStatus: domain.ProbeStatus(filter.ProbeStatus), Assignment: filter.Assignment,
+		},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return s.publicNodes(values), total, nil
+}
+
+func (s *Service) ListAll(ctx context.Context, scope domain.Scope, sort repository.SortQuery) ([]domain.PublicNode, error) {
+	if !validListScope(scope) {
+		return nil, ErrInvalidFilter
+	}
 	if !repository.IsValidSort(sort, "name", "scope", "proxy", "clearance", "health") {
 		return nil, ErrInvalidSort
 	}
@@ -122,11 +181,31 @@ func (s *Service) List(ctx context.Context, scope domain.Scope, sort repository.
 	if err != nil {
 		return nil, err
 	}
+	return s.publicNodes(values), nil
+}
+
+func (s *Service) publicNodes(values []domain.Node) []domain.PublicNode {
 	result := make([]domain.PublicNode, 0, len(values))
 	for _, value := range values {
 		result = append(result, s.publicNode(value))
 	}
-	return result, nil
+	return result
+}
+
+func validListScope(scope domain.Scope) bool {
+	return scope == "" || scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset
+}
+
+func validListValue(value string, allowed ...string) bool {
+	if value == "" {
+		return true
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) Create(ctx context.Context, input Input) (domain.PublicNode, error) {
@@ -177,6 +256,10 @@ func (s *Service) validateFallbackNodeUpdate(ctx context.Context, node domain.No
 	if err != nil {
 		return err
 	}
+	return s.validateFallbackNodeUpdateWithConfig(node, config)
+}
+
+func (s *Service) validateFallbackNodeUpdateWithConfig(node domain.Node, config domain.OperationsConfig) error {
 	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
 		fallback := config.FallbackFor(scope)
 		if fallback.Mode != domain.FallbackModeFixed || fallback.NodeID != node.ID {
@@ -187,6 +270,86 @@ func (s *Service) validateFallbackNodeUpdate(ctx context.Context, node domain.No
 		}
 	}
 	return nil
+}
+
+// UpdateManyEnabled changes only the scheduling state, leaving proxy secrets,
+// health, probes, and account bindings untouched.
+func (s *Service) UpdateManyEnabled(ctx context.Context, nodeIDs []uint64, enabled bool) (int, error) {
+	ids := uniqueIDs(nodeIDs)
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("%w: 代理节点参数无效", ErrInvalidInput)
+	}
+
+	// Disabling a fixed fallback would make the persisted routing policy
+	// invalid. At most four fallback nodes need point lookups, regardless of
+	// the batch size.
+	if !enabled && s.operations != nil {
+		config, err := s.operations.GetEgressOperationsConfig(ctx)
+		if err != nil {
+			return 0, err
+		}
+		selected := make(map[uint64]struct{}, len(ids))
+		for _, id := range ids {
+			selected[id] = struct{}{}
+		}
+		fallbackNodeIDs := make(map[uint64]struct{}, 4)
+		for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+			fallback := config.FallbackFor(scope)
+			if fallback.Mode == domain.FallbackModeFixed {
+				if _, exists := selected[fallback.NodeID]; exists {
+					fallbackNodeIDs[fallback.NodeID] = struct{}{}
+				}
+			}
+		}
+		for id := range fallbackNodeIDs {
+			node, err := s.repository.GetEgressNode(ctx, id)
+			if errors.Is(err, repository.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			node.Enabled = false
+			if err := s.validateFallbackNodeUpdateWithConfig(node, config); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	if batch, ok := s.repository.(BatchNodeEnabledUpdater); ok {
+		updated, err := batch.UpdateEgressNodesEnabled(ctx, ids, enabled)
+		if errors.Is(err, repository.ErrEgressFallbackInUse) {
+			return 0, fmt.Errorf("%w: 固定回退节点不能被批量禁用", ErrInvalidInput)
+		}
+		if err != nil {
+			return 0, err
+		}
+		if updated > 0 {
+			s.forgetClearances(ids)
+		}
+		return updated, nil
+	}
+
+	updated := 0
+	for _, id := range ids {
+		node, err := s.repository.GetEgressNode(ctx, id)
+		if errors.Is(err, repository.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return updated, err
+		}
+		if node.Enabled == enabled {
+			continue
+		}
+		node.Enabled = enabled
+		if _, err := s.repository.UpdateEgressNode(ctx, node); err != nil {
+			return updated, err
+		}
+		s.forgetClearance(id)
+		updated++
+	}
+	return updated, nil
 }
 
 func (s *Service) Delete(ctx context.Context, id uint64) error {
@@ -232,6 +395,61 @@ func (s *Service) DeleteMany(ctx context.Context, nodeIDs []uint64) (int, error)
 		deleted++
 	}
 	return deleted, nil
+}
+
+func (s *Service) PreviewUnhealthyCleanup(ctx context.Context) (UnhealthyCleanupPreview, error) {
+	if cleaner, ok := s.repository.(repository.EgressNodeUnhealthyCleaner); ok {
+		value, err := cleaner.PreviewUnhealthyEgressNodes(ctx)
+		return UnhealthyCleanupPreview{
+			Nodes: value.Nodes, BoundAccounts: value.BoundAccounts, SubscriptionManaged: value.SubscriptionManaged,
+		}, err
+	}
+	values, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return UnhealthyCleanupPreview{}, err
+	}
+	result := UnhealthyCleanupPreview{}
+	for _, value := range values {
+		if value.IPv4Probe.Status != domain.ProbeStatusUnhealthy || value.IPv6Probe.Status != domain.ProbeStatusUnhealthy {
+			continue
+		}
+		result.Nodes++
+		result.BoundAccounts += int64(value.AssignedAccountCount)
+		if value.SourceID != 0 {
+			result.SubscriptionManaged++
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) DeleteUnhealthy(ctx context.Context) (int, error) {
+	if cleaner, ok := s.repository.(repository.EgressNodeUnhealthyCleaner); ok {
+		ids, err := cleaner.DeleteUnhealthyEgressNodes(ctx)
+		if err != nil {
+			return 0, err
+		}
+		for _, id := range ids {
+			s.forgetClearance(id)
+		}
+		if len(ids) > 0 {
+			s.invalidateOperationsConfig()
+		}
+		return len(ids), nil
+	}
+	values, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return 0, err
+	}
+	ids := make([]uint64, 0)
+	for _, value := range values {
+		if value.IPv4Probe.Status == domain.ProbeStatusUnhealthy && value.IPv6Probe.Status == domain.ProbeStatusUnhealthy {
+			ids = append(ids, value.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return s.DeleteMany(ctx, ids)
 }
 
 func (s *Service) RefreshClearance(ctx context.Context, id uint64) error {
@@ -378,6 +596,22 @@ func (s *Service) forgetClearance(id uint64) {
 	}
 }
 
+func (s *Service) forgetClearances(ids []uint64) {
+	s.mu.RLock()
+	manager := s.clearance
+	s.mu.RUnlock()
+	if manager == nil {
+		return
+	}
+	if batch, ok := manager.(BatchClearanceManager); ok {
+		batch.ForgetClearances(ids)
+		return
+	}
+	for _, id := range ids {
+		manager.ForgetClearance(id)
+	}
+}
+
 func (s *Service) applyInput(value domain.Node, input Input, create bool) (domain.Node, error) {
 	proxyPool := value.ProxyPool
 	if input.ProxyPool != nil {
@@ -457,6 +691,9 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 		value.ProbeLatencyMS = 0
 		value.ExitIP = ""
 		value.ProbeError = ""
+		value.ProbeProvider = ""
+		value.IPv4Probe = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnknown}
+		value.IPv6Probe = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnknown}
 	}
 	// Any administrator edit invalidates freshness. Keep the binding fingerprint:
 	// managed mode may use the existing cookie as last-known-good only when the
@@ -486,6 +723,8 @@ func (s *Service) publicNode(value domain.Node) domain.PublicNode {
 		AccountBoundProxy: accountBoundProxy,
 		Health:            health, FailureCount: failureCount, CooldownUntil: cooldownUntil, LastError: lastError,
 		ProbeStatus: value.ProbeStatus, LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeProvider: value.ProbeProvider,
+		IPv4Probe:     value.IPv4Probe, IPv6Probe: value.IPv6Probe,
 		AssignedAccountCount: value.AssignedAccountCount,
 		CreatedAt:            value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}

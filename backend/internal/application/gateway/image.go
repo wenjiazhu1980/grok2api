@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -165,20 +166,22 @@ func (s *Service) executeImage(
 		}
 	}()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
-	}
+	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
-	for attempt := 0; attempt < attempts; attempt++ {
-		lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false)
+	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+		lease, err = s.selector.AcquireForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
 		if err != nil {
-			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
+			errorCode := "upstream_unavailable"
+			var selectionFailure *SelectionUnavailableError
+			if errors.As(err, &selectionFailure) {
+				errorCode = selectionFailure.Code()
+			}
+			writeFailureAudit(http.StatusServiceUnavailable, errorCode, lastCredentialFailure)
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
@@ -224,7 +227,7 @@ func (s *Service) executeImage(
 			lease.Release()
 			continue
 		}
-		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
+		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attemptPolicy.hasNext(attempt) {
 			_, _ = readRetryableBody(response.Body)
 			lease.Release()
 			delete(excluded, credential.ID)
@@ -237,7 +240,7 @@ func (s *Service) executeImage(
 			if reconcileErr != nil || !exhausted {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
-			if attempt+1 < attempts {
+			if attemptPolicy.hasNext(attempt) {
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()
 				continue

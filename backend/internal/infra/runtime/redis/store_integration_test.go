@@ -2,6 +2,8 @@ package redis
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -27,21 +29,16 @@ func TestRedisRuntimeStoreIntegration(t *testing.T) {
 		database = parsed
 	}
 	ctx := context.Background()
+	keyPrefix := "grok2api:test:" + time.Now().UTC().Format("150405.000000") + ":"
 	store, err := Open(ctx, Config{
 		Address: address, Username: os.Getenv("TEST_REDIS_USERNAME"), Password: os.Getenv("TEST_REDIS_PASSWORD"), Database: database,
-		KeyPrefix: "grok2api:test:" + time.Now().UTC().Format("150405.000000") + ":", ConcurrencyLease: time.Minute,
+		KeyPrefix: keyPrefix, ConcurrencyLease: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if os.Getenv("TEST_REDIS_FLUSH_DATABASE") == "1" {
-		defer func() {
-			if err := store.client.FlushDB(ctx).Err(); err != nil {
-				t.Errorf("flush Redis test database: %v", err)
-			}
-		}()
-	}
+	defer cleanupRedisTestPrefix(t, ctx, store.client, keyPrefix)
 
 	if allowed, err := store.Allow(ctx, "key", 1, time.Now()); err != nil || !allowed {
 		t.Fatalf("first rate allowance = %v, err = %v", allowed, err)
@@ -59,6 +56,28 @@ func TestRedisRuntimeStoreIntegration(t *testing.T) {
 		t.Fatalf("duplicate concurrency acquire = %v, err = %v", acquired, err)
 	}
 	release()
+	releaseFailure := &failOnceRedisCommandHook{}
+	store.client.AddHook(releaseFailure)
+	release, acquired, err = limiter.Acquire(ctx, "account:release-retry", 1)
+	if err != nil || !acquired {
+		t.Fatalf("release retry acquire = %v, err = %v", acquired, err)
+	}
+	releaseFailure.arm("evalsha")
+	release()
+	releaseDeadline := time.Now().Add(2 * time.Second)
+	for {
+		current, currentErr := limiter.Current(ctx, "account:release-retry")
+		if currentErr != nil {
+			t.Fatal(currentErr)
+		}
+		if current == 0 {
+			break
+		}
+		if time.Now().After(releaseDeadline) {
+			t.Fatalf("failed concurrency release was not reconciled: current=%d", current)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	concurrencyKey := store.key("concurrency", "snapshot")
 	now := time.Now().UTC()
 	if err := store.client.ZAdd(ctx, concurrencyKey,
@@ -93,6 +112,32 @@ func TestRedisRuntimeStoreIntegration(t *testing.T) {
 	}
 	if _, ok, err := store.Get(ctx, "sticky", time.Now().UTC()); err != nil || ok {
 		t.Fatalf("deleted sticky remains available: ok=%v err=%v", ok, err)
+	}
+	batchIDs := make([]uint64, 0, stickyDeletePipelineSize+2)
+	batchKeys := make([]string, 0, stickyDeletePipelineSize+2)
+	for index := range stickyDeletePipelineSize + 2 {
+		accountID := uint64(100 + index)
+		key := "sticky-batch-" + strconv.Itoa(index)
+		batchIDs = append(batchIDs, accountID)
+		batchKeys = append(batchKeys, key)
+		if err := store.Set(ctx, key, accountID, time.Now().UTC().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Set(ctx, "sticky-batch-keep", 9, time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	batchIDs = append(batchIDs, batchIDs[0], 0)
+	if err := store.DeleteByAccounts(ctx, batchIDs); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range batchKeys {
+		if _, ok, err := store.Get(ctx, key, time.Now().UTC()); err != nil || ok {
+			t.Fatalf("batch-deleted sticky %q remains: ok=%v err=%v", key, ok, err)
+		}
+	}
+	if id, ok, err := store.Get(ctx, "sticky-batch-keep", time.Now().UTC()); err != nil || !ok || id != 9 {
+		t.Fatalf("unrelated batch sticky = %d, ok=%v err=%v", id, ok, err)
 	}
 
 	observedAt := time.Now().UTC()
@@ -277,6 +322,64 @@ func TestRedisRuntimeStoreIntegration(t *testing.T) {
 	}
 }
 
+type failOnceRedisCommandHook struct {
+	mu      sync.Mutex
+	command string
+}
+
+func (h *failOnceRedisCommandHook) arm(command string) {
+	h.mu.Lock()
+	h.command = command
+	h.mu.Unlock()
+}
+
+func (h *failOnceRedisCommandHook) DialHook(next redisclient.DialHook) redisclient.DialHook {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		return next(ctx, network, address)
+	}
+}
+
+func (h *failOnceRedisCommandHook) ProcessHook(next redisclient.ProcessHook) redisclient.ProcessHook {
+	return func(ctx context.Context, command redisclient.Cmder) error {
+		h.mu.Lock()
+		fail := h.command != "" && command.Name() == h.command
+		if fail {
+			h.command = ""
+		}
+		h.mu.Unlock()
+		if fail {
+			return errors.New("injected Redis command failure")
+		}
+		return next(ctx, command)
+	}
+}
+
+func (h *failOnceRedisCommandHook) ProcessPipelineHook(next redisclient.ProcessPipelineHook) redisclient.ProcessPipelineHook {
+	return next
+}
+
+func cleanupRedisTestPrefix(t *testing.T, ctx context.Context, client *redisclient.Client, prefix string) {
+	t.Helper()
+	var cursor uint64
+	for {
+		keys, next, err := client.Scan(ctx, cursor, prefix+"*", 256).Result()
+		if err != nil {
+			t.Errorf("scan Redis test keys: %v", err)
+			return
+		}
+		if len(keys) > 0 {
+			if err := client.Unlink(ctx, keys...).Err(); err != nil {
+				t.Errorf("delete Redis test keys: %v", err)
+				return
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return
+		}
+	}
+}
+
 func TestRedisInvalidationBusIntegration(t *testing.T) {
 	address := os.Getenv("TEST_REDIS_ADDRESS")
 	if address == "" {
@@ -291,21 +394,16 @@ func TestRedisInvalidationBusIntegration(t *testing.T) {
 		database = parsed
 	}
 	ctx := context.Background()
+	keyPrefix := "grok2api:invalidation-test:" + time.Now().UTC().Format("150405.000000") + ":"
 	store, err := Open(ctx, Config{
 		Address: address, Username: os.Getenv("TEST_REDIS_USERNAME"), Password: os.Getenv("TEST_REDIS_PASSWORD"), Database: database,
-		KeyPrefix: "grok2api:invalidation-test:" + time.Now().UTC().Format("150405.000000") + ":", ConcurrencyLease: time.Minute,
+		KeyPrefix: keyPrefix, ConcurrencyLease: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if os.Getenv("TEST_REDIS_FLUSH_DATABASE") == "1" {
-		defer func() {
-			if err := store.client.FlushDB(ctx).Err(); err != nil {
-				t.Errorf("flush Redis test database: %v", err)
-			}
-		}()
-	}
+	defer cleanupRedisTestPrefix(t, ctx, store.client, keyPrefix)
 
 	listenerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -353,6 +451,18 @@ func TestRedisInvalidationBusIntegration(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second invalidation notification was not delivered")
+	}
+	clientKeyEvent := repository.InvalidationEvent{Kind: repository.InvalidationClientKeyChanged, ClientKeyID: 42, SourceInstance: "instance-a"}
+	if err := store.PublishInvalidation(ctx, clientKeyEvent); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case clientKeyInvalidation := <-received:
+		if clientKeyInvalidation.Layer() != repository.InvalidationLayerClientKey || clientKeyInvalidation.ClientKeyID != 42 || clientKeyInvalidation.Revision == 0 {
+			t.Fatalf("client-key invalidation = %#v", clientKeyInvalidation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client-key invalidation notification was not delivered")
 	}
 	cancel()
 	if err := <-done; err != nil {

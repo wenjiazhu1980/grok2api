@@ -3,6 +3,7 @@ package relational
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -42,6 +43,63 @@ func (r *EgressRepository) ListEgressNodes(ctx context.Context, scope egress.Sco
 		values = append(values, value)
 	}
 	return values, nil
+}
+
+func (r *EgressRepository) ListEgressNodePage(ctx context.Context, input repository.EgressNodeListQuery) ([]egress.Node, int64, error) {
+	query := r.db.db.WithContext(ctx).Model(&egressNodeModel{})
+	if search := strings.TrimSpace(input.Page.Search); search != "" {
+		query = query.Where("LOWER(egress_nodes.name) LIKE ?", "%"+strings.ToLower(search)+"%")
+	}
+	if input.Filter.Scope != "" {
+		query = query.Where("egress_nodes.scope = ?", input.Filter.Scope)
+	}
+	if input.Filter.Enabled != nil {
+		query = query.Where("egress_nodes.enabled = ?", *input.Filter.Enabled)
+	}
+	if input.Filter.ProbeStatus != "" {
+		query = query.Where("egress_nodes.probe_status = ?", input.Filter.ProbeStatus)
+	}
+	switch input.Filter.Assignment {
+	case "bound":
+		query = query.Where("EXISTS (SELECT 1 FROM provider_accounts account WHERE account.egress_node_id = egress_nodes.id)")
+	case "unbound":
+		query = query.Where("NOT EXISTS (SELECT 1 FROM provider_accounts account WHERE account.egress_node_id = egress_nodes.id)")
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	query = applyStableSort(query, input.Page.Sort, map[string]sortSpec{
+		"name":      {expression: "LOWER(egress_nodes.name)"},
+		"scope":     {expression: "egress_nodes.scope"},
+		"proxy":     {expression: "CASE WHEN egress_nodes.encrypted_proxy_url <> '' THEN 0 ELSE 1 END"},
+		"clearance": {expression: "CASE WHEN egress_nodes.encrypted_cloudflare_cookie <> '' THEN 0 ELSE 1 END"},
+		"health":    {expression: "egress_nodes.health", defaultDirection: repository.SortDescending},
+	}, sortSpec{expression: "egress_nodes.scope"}, "egress_nodes.id")
+	var rows []egressNodeModel
+	if err := query.Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	if len(rows) == 0 {
+		return []egress.Node{}, total, nil
+	}
+
+	ids := make([]uint64, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	counts, err := r.assignedAccountCountsForNodes(ctx, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	values := make([]egress.Node, 0, len(rows))
+	for _, row := range rows {
+		value := toEgressDomain(row)
+		value.AssignedAccountCount = counts[value.ID]
+		values = append(values, value)
+	}
+	return values, total, nil
 }
 
 func (r *EgressRepository) GetEgressNode(ctx context.Context, id uint64) (egress.Node, error) {
@@ -88,6 +146,39 @@ func (r *EgressRepository) UpdateEgressNode(ctx context.Context, value egress.No
 	return toEgressDomain(row), nil
 }
 
+func (r *EgressRepository) UpdateEgressNodesEnabled(ctx context.Context, ids []uint64, enabled bool) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if enabled {
+		result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
+			Where("id IN ? AND enabled <> ?", ids, true).
+			Updates(map[string]any{"enabled": true, "updated_at": time.Now().UTC()})
+		return int(result.RowsAffected), mapError(result.Error)
+	}
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		config, err := lockEgressOperationsConfig(tx)
+		if err != nil {
+			return err
+		}
+		var lockedIDs []uint64
+		if err := tx.Model(&egressNodeModel{}).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id IN ?", ids).Order("id ASC").Pluck("id", &lockedIDs).Error; err != nil {
+			return err
+		}
+		if configReferencesAnyFallbackNode(config, lockedIDs) {
+			return repository.ErrEgressFallbackInUse
+		}
+		result := tx.Model(&egressNodeModel{}).
+			Where("id IN ? AND enabled <> ?", lockedIDs, false).
+			Updates(map[string]any{"enabled": false, "updated_at": time.Now().UTC()})
+		updated = result.RowsAffected
+		return result.Error
+	})
+	return int(updated), mapError(err)
+}
+
 func (r *EgressRepository) UpdateEgressNodeClearance(ctx context.Context, id uint64, encryptedCookie, userAgent, fingerprint, bindingFingerprint string, refreshedAt time.Time) error {
 	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("id = ?", id).Updates(map[string]any{
 		"encrypted_cloudflare_cookie": encryptedCookie, "user_agent": userAgent,
@@ -132,17 +223,30 @@ func (r *EgressRepository) UpdateEgressNodeLastError(ctx context.Context, id uin
 
 // UpdateEgressNodeProbe persists the result of a direct proxy probe without
 // affecting request health or Cloudflare clearance state.
-func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64, value egress.ProbeResult) error {
-	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("id = ?", id).Updates(map[string]any{
-		"probe_status": value.Status, "last_probed_at": value.TestedAt.UTC(),
-		"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "probe_error": value.Error,
-		"updated_at": time.Now().UTC(),
-	})
+func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64, expectedEncryptedProxyURL string, value egress.ProbeResult) error {
+	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
+		Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).
+		Updates(map[string]any{
+			"probe_status": value.Status, "last_probed_at": value.TestedAt.UTC(),
+			"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "probe_error": value.Error, "probe_provider": storedProbeProvider(value.Provider),
+			"ipv4_probe_status": normalizedProbeStatus(value.IPv4.Status), "ipv4_last_probed_at": probeTestedAt(value.IPv4),
+			"ipv4_probe_latency_ms": value.IPv4.LatencyMS, "ipv4_exit_ip": value.IPv4.ExitIP, "ipv4_probe_error": value.IPv4.Error,
+			"ipv6_probe_status": normalizedProbeStatus(value.IPv6.Status), "ipv6_last_probed_at": probeTestedAt(value.IPv6),
+			"ipv6_probe_latency_ms": value.IPv6.LatencyMS, "ipv6_exit_ip": value.IPv6.ExitIP, "ipv6_probe_error": value.IPv6.Error,
+			"updated_at": time.Now().UTC(),
+		})
 	if result.Error != nil {
 		return mapError(result.Error)
 	}
 	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
+		var count int64
+		if err := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("id = ?", id).Count(&count).Error; err != nil {
+			return mapError(err)
+		}
+		if count == 0 {
+			return repository.ErrNotFound
+		}
+		return repository.ErrConflict
 	}
 	return nil
 }
@@ -301,7 +405,10 @@ func (r *EgressRepository) UpsertEgressNodesFromSource(ctx context.Context, sour
 			stale = stale.Where("source_key NOT IN ?", keys)
 		}
 		if err := stale.Updates(map[string]any{
-			"enabled": false, "probe_status": string(egress.ProbeStatusUnknown), "probe_error": "subscription entry removed", "updated_at": time.Now().UTC(),
+			"enabled": false, "probe_status": string(egress.ProbeStatusUnknown), "probe_error": "subscription entry removed", "probe_provider": "",
+			"ipv4_probe_status": string(egress.ProbeStatusUnknown), "ipv4_last_probed_at": nil, "ipv4_probe_latency_ms": 0, "ipv4_exit_ip": "", "ipv4_probe_error": "subscription entry removed",
+			"ipv6_probe_status": string(egress.ProbeStatusUnknown), "ipv6_last_probed_at": nil, "ipv6_probe_latency_ms": 0, "ipv6_exit_ip": "", "ipv6_probe_error": "subscription entry removed",
+			"updated_at": time.Now().UTC(),
 		}).Error; err != nil {
 			return mapError(err)
 		}
@@ -327,10 +434,97 @@ func (r *EgressRepository) GetEgressOperationsConfig(ctx context.Context) (egres
 func (r *EgressRepository) SaveEgressOperationsConfig(ctx context.Context, value egress.OperationsConfig) (egress.OperationsConfig, error) {
 	row := fromEgressOperationsConfigDomain(value)
 	row.ID = 1
-	if err := r.db.db.WithContext(ctx).Clauses(clause.OnConflict{UpdateAll: true}).Create(&row).Error; err != nil {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockEgressOperationsConfig(tx); err != nil {
+			return err
+		}
+		if err := validateLockedEgressFallbackNodes(tx, row); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&row).Error
+	})
+	if err != nil {
 		return egress.OperationsConfig{}, mapError(err)
 	}
 	return toEgressOperationsConfigDomain(row), nil
+}
+
+func lockEgressOperationsConfig(tx *gorm.DB) (egressOperationsConfigModel, error) {
+	defaults := fromEgressOperationsConfigDomain(egress.DefaultOperationsConfig())
+	defaults.ID = 1
+	defaults.UpdatedAt = time.Now().UTC()
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaults).Error; err != nil {
+		return egressOperationsConfigModel{}, err
+	}
+	var row egressOperationsConfigModel
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, 1).Error; err != nil {
+		return egressOperationsConfigModel{}, err
+	}
+	return row, nil
+}
+
+func configReferencesAnyFallbackNode(config egressOperationsConfigModel, ids []uint64) bool {
+	selected := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		selected[id] = struct{}{}
+	}
+	for _, fallback := range []struct {
+		mode   string
+		nodeID uint64
+	}{
+		{config.BuildFallbackMode, config.BuildFallbackNodeID},
+		{config.WebFallbackMode, config.WebFallbackNodeID},
+		{config.ConsoleFallbackMode, config.ConsoleFallbackNodeID},
+		{config.WebAssetFallbackMode, config.WebAssetFallbackNodeID},
+	} {
+		if egress.FallbackMode(fallback.mode).Normalized() != egress.FallbackModeFixed {
+			continue
+		}
+		if _, exists := selected[fallback.nodeID]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func validateLockedEgressFallbackNodes(tx *gorm.DB, config egressOperationsConfigModel) error {
+	fallbacks := []struct {
+		scope  egress.Scope
+		mode   string
+		nodeID uint64
+	}{
+		{egress.ScopeBuild, config.BuildFallbackMode, config.BuildFallbackNodeID},
+		{egress.ScopeWeb, config.WebFallbackMode, config.WebFallbackNodeID},
+		{egress.ScopeConsole, config.ConsoleFallbackMode, config.ConsoleFallbackNodeID},
+		{egress.ScopeWebAsset, config.WebAssetFallbackMode, config.WebAssetFallbackNodeID},
+	}
+	ids := make([]uint64, 0, len(fallbacks))
+	for _, fallback := range fallbacks {
+		if egress.FallbackMode(fallback.mode).Normalized() == egress.FallbackModeFixed && fallback.nodeID != 0 {
+			ids = append(ids, fallback.nodeID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var rows []egressNodeModel
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", ids).Order("id ASC").Find(&rows).Error; err != nil {
+		return err
+	}
+	byID := make(map[uint64]egressNodeModel, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	for _, fallback := range fallbacks {
+		if egress.FallbackMode(fallback.mode).Normalized() != egress.FallbackModeFixed {
+			continue
+		}
+		node, exists := byID[fallback.nodeID]
+		if !exists || !node.Enabled || node.ProxyPool || node.EncryptedProxyURL == "" || !egress.SupportsScope(egress.Scope(node.Scope), fallback.scope) {
+			return repository.ErrEgressFallbackInUse
+		}
+	}
+	return nil
 }
 
 func (r *EgressRepository) DeleteEgressNode(ctx context.Context, id uint64) error {
@@ -363,29 +557,72 @@ func (r *EgressRepository) DeleteEgressNodes(ctx context.Context, ids []uint64) 
 	}
 	var deleted int64
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for start := 0; start < len(ids); start += 500 {
-			end := start + 500
-			if end > len(ids) {
-				end = len(ids)
-			}
-			batch := ids[start:end]
-			if result := tx.Model(&accountModel{}).Where("egress_node_id IN ?", batch).Updates(map[string]any{
-				"egress_node_id": nil, "egress_assignment_mode": "", "egress_assigned_at": nil,
-			}); result.Error != nil {
-				return result.Error
-			}
-			if err := clearEgressFallbackNodeReferences(tx, batch); err != nil {
-				return err
-			}
-			result := tx.Where("id IN ?", batch).Delete(&egressNodeModel{})
-			if result.Error != nil {
-				return result.Error
-			}
-			deleted += result.RowsAffected
-		}
-		return nil
+		var err error
+		deleted, err = deleteEgressNodeIDs(tx, ids)
+		return err
 	})
 	return int(deleted), mapError(err)
+}
+
+func (r *EgressRepository) PreviewUnhealthyEgressNodes(ctx context.Context) (repository.EgressNodeCleanupPreview, error) {
+	var result repository.EgressNodeCleanupPreview
+	if err := r.unhealthyEgressNodes(ctx).Count(&result.Nodes).Error; err != nil {
+		return result, mapError(err)
+	}
+	if err := r.unhealthyEgressNodes(ctx).Where("source_id IS NOT NULL").Count(&result.SubscriptionManaged).Error; err != nil {
+		return result, mapError(err)
+	}
+	subquery := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Select("id").
+		Where("ipv4_probe_status = ? AND ipv6_probe_status = ?", egress.ProbeStatusUnhealthy, egress.ProbeStatusUnhealthy)
+	if err := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("egress_node_id IN (?)", subquery).Count(&result.BoundAccounts).Error; err != nil {
+		return result, mapError(err)
+	}
+	return result, nil
+}
+
+func (r *EgressRepository) unhealthyEgressNodes(ctx context.Context) *gorm.DB {
+	return r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
+		Where("ipv4_probe_status = ? AND ipv6_probe_status = ?", egress.ProbeStatusUnhealthy, egress.ProbeStatusUnhealthy)
+}
+
+func (r *EgressRepository) DeleteUnhealthyEgressNodes(ctx context.Context) ([]uint64, error) {
+	ids := make([]uint64, 0)
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Model(&egressNodeModel{}).
+			Where("ipv4_probe_status = ? AND ipv6_probe_status = ?", egress.ProbeStatusUnhealthy, egress.ProbeStatusUnhealthy).
+			Order("id ASC")
+		if tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		_, err := deleteEgressNodeIDs(tx, ids)
+		return err
+	})
+	return ids, mapError(err)
+}
+
+func deleteEgressNodeIDs(tx *gorm.DB, ids []uint64) (int64, error) {
+	var deleted int64
+	for start := 0; start < len(ids); start += 500 {
+		end := min(start+500, len(ids))
+		batch := ids[start:end]
+		if result := tx.Model(&accountModel{}).Where("egress_node_id IN ?", batch).Updates(map[string]any{
+			"egress_node_id": nil, "egress_assignment_mode": "", "egress_assigned_at": nil,
+		}); result.Error != nil {
+			return deleted, result.Error
+		}
+		if err := clearEgressFallbackNodeReferences(tx, batch); err != nil {
+			return deleted, err
+		}
+		result := tx.Where("id IN ?", batch).Delete(&egressNodeModel{})
+		if result.Error != nil {
+			return deleted, result.Error
+		}
+		deleted += result.RowsAffected
+	}
+	return deleted, nil
 }
 
 func clearEgressFallbackNodeReferences(tx *gorm.DB, ids []uint64) error {
@@ -447,14 +684,25 @@ func clearInvalidEgressFallbackNodeReferences(tx *gorm.DB) error {
 }
 
 func (r *EgressRepository) assignedAccountCounts(ctx context.Context) (map[uint64]int, error) {
+	return r.assignedAccountCountsForNodes(ctx, nil)
+}
+
+func (r *EgressRepository) assignedAccountCountsForNodes(ctx context.Context, nodeIDs []uint64) (map[uint64]int, error) {
 	type row struct {
 		NodeID uint64
 		Count  int
 	}
 	var rows []row
-	if err := r.db.db.WithContext(ctx).Model(&accountModel{}).
+	query := r.db.db.WithContext(ctx).Model(&accountModel{}).
 		Select("egress_node_id AS node_id, COUNT(*) AS count").
-		Where("egress_node_id IS NOT NULL").Group("egress_node_id").Scan(&rows).Error; err != nil {
+		Where("egress_node_id IS NOT NULL")
+	if nodeIDs != nil {
+		if len(nodeIDs) == 0 {
+			return map[uint64]int{}, nil
+		}
+		query = query.Where("egress_node_id IN ?", nodeIDs)
+	}
+	if err := query.Group("egress_node_id").Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	result := make(map[uint64]int, len(rows))
@@ -473,7 +721,10 @@ func toEgressDomain(row egressNodeModel) egress.Node {
 		ClearanceBindingFingerprint: row.ClearanceBindingFingerprint,
 		Health:                      row.Health, FailureCount: row.FailureCount, CooldownUntil: row.CooldownUntil, LastError: row.LastError,
 		ProbeStatus: egress.ProbeStatus(row.ProbeStatus), LastProbedAt: row.LastProbedAt, ProbeLatencyMS: row.ProbeLatencyMS, ExitIP: row.ExitIP, ProbeError: row.ProbeError,
-		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		ProbeProvider: storedProbeProvider(egress.ProbeProvider(row.ProbeProvider)),
+		IPv4Probe:     probeFamilyFromRow(row.IPv4ProbeStatus, row.IPv4LastProbedAt, row.IPv4ProbeLatencyMS, row.IPv4ExitIP, row.IPv4ProbeError),
+		IPv6Probe:     probeFamilyFromRow(row.IPv6ProbeStatus, row.IPv6LastProbedAt, row.IPv6ProbeLatencyMS, row.IPv6ExitIP, row.IPv6ProbeError),
+		CreatedAt:     row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
 }
 
@@ -494,8 +745,43 @@ func fromEgressDomain(value egress.Node) egressNodeModel {
 		ClearanceBindingFingerprint: value.ClearanceBindingFingerprint,
 		Health:                      health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,
 		ProbeStatus: string(probeStatus), LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeProvider:   string(storedProbeProvider(value.ProbeProvider)),
+		IPv4ProbeStatus: string(normalizedProbeStatus(value.IPv4Probe.Status)), IPv4LastProbedAt: probeTestedAt(value.IPv4Probe), IPv4ProbeLatencyMS: value.IPv4Probe.LatencyMS, IPv4ExitIP: value.IPv4Probe.ExitIP, IPv4ProbeError: value.IPv4Probe.Error,
+		IPv6ProbeStatus: string(normalizedProbeStatus(value.IPv6Probe.Status)), IPv6LastProbedAt: probeTestedAt(value.IPv6Probe), IPv6ProbeLatencyMS: value.IPv6Probe.LatencyMS, IPv6ExitIP: value.IPv6Probe.ExitIP, IPv6ProbeError: value.IPv6Probe.Error,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
+}
+
+func normalizedProbeStatus(value egress.ProbeStatus) egress.ProbeStatus {
+	if value.IsValid() {
+		return value
+	}
+	return egress.ProbeStatusUnknown
+}
+
+func storedProbeProvider(value egress.ProbeProvider) egress.ProbeProvider {
+	if value.IsValid() {
+		return value
+	}
+	return ""
+}
+
+func probeTestedAt(value egress.ProbeFamilyResult) *time.Time {
+	if value.TestedAt.IsZero() {
+		return nil
+	}
+	testedAt := value.TestedAt.UTC()
+	return &testedAt
+}
+
+func probeFamilyFromRow(status string, testedAt *time.Time, latencyMS int, exitIP, probeError string) egress.ProbeFamilyResult {
+	result := egress.ProbeFamilyResult{
+		Status: normalizedProbeStatus(egress.ProbeStatus(status)), LatencyMS: latencyMS, ExitIP: exitIP, Error: probeError,
+	}
+	if testedAt != nil {
+		result.TestedAt = testedAt.UTC()
+	}
+	return result
 }
 
 func toEgressSubscriptionSourceDomain(row egressSubscriptionSourceModel) egress.SubscriptionSource {
@@ -518,6 +804,7 @@ func fromEgressSubscriptionSourceDomain(value egress.SubscriptionSource) egressS
 
 func toEgressOperationsConfigDomain(row egressOperationsConfigModel) egress.OperationsConfig {
 	return egress.OperationsConfig{
+		ProbeProvider:        egress.ProbeProvider(row.ProbeProvider).Normalized(),
 		ProbeIntervalSeconds: row.ProbeIntervalSeconds, AutoAssignEnabled: row.AutoAssignEnabled, AutoBalanceEnabled: row.AutoBalanceEnabled,
 		AssignmentIntervalSeconds: row.AssignmentIntervalSeconds,
 		Fallbacks: map[egress.Scope]egress.FallbackConfig{
@@ -536,7 +823,7 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 	consoleFallback := value.FallbackFor(egress.ScopeConsole)
 	webAssetFallback := value.FallbackFor(egress.ScopeWebAsset)
 	return egressOperationsConfigModel{
-		ID: 1, ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
+		ID: 1, ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
 		BuildFallbackMode: string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
 		WebFallbackMode: string(webFallback.Mode), WebFallbackNodeID: webFallback.NodeID,

@@ -18,9 +18,11 @@ import (
 	"time"
 
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
+	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -139,6 +141,130 @@ func TestPostgresConcurrentSchemaInitializationUsesMigrationLock(t *testing.T) {
 	}
 }
 
+func TestPostgresAccountLinkMutationLockSerializesTransactions(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	database, err := OpenPostgres(ctx, dsn, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	first := database.db.WithContext(ctx).Begin()
+	if first.Error != nil {
+		t.Fatal(first.Error)
+	}
+	defer first.Rollback()
+	if err := lockAccountLinkMutation(first); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		second := database.db.WithContext(ctx).Begin()
+		if second.Error != nil {
+			result <- second.Error
+			return
+		}
+		close(started)
+		err := lockAccountLinkMutation(second)
+		if rollbackErr := second.Rollback().Error; err == nil {
+			err = rollbackErr
+		}
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("second account-link mutation was not serialized: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := first.Rollback().Error; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(accountLinkLockTimeout + time.Second):
+		t.Fatal("account-link mutation did not resume after advisory lock release")
+	}
+}
+
+func TestPostgresAccountLinkMutationLockHasBoundedWait(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	database, err := OpenPostgres(ctx, dsn, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	first := database.db.WithContext(ctx).Begin()
+	if first.Error != nil {
+		t.Fatal(first.Error)
+	}
+	defer first.Rollback()
+	if err := lockAccountLinkMutation(first); err != nil {
+		t.Fatal(err)
+	}
+
+	second := database.db.WithContext(ctx).Begin()
+	if second.Error != nil {
+		t.Fatal(second.Error)
+	}
+	defer second.Rollback()
+	startedAt := time.Now()
+	err = lockAccountLinkMutationWithTimeout(second, 100*time.Millisecond)
+	if !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("bounded link-mutation lock error = %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 75*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("bounded link-mutation lock elapsed = %s", elapsed)
+	}
+}
+
+func assertPostgresAccountLinkMutationWaits(t *testing.T, ctx context.Context, database *Database, operation func() error) {
+	t.Helper()
+	guard := database.db.WithContext(ctx).Begin()
+	if guard.Error != nil {
+		t.Fatal(guard.Error)
+	}
+	defer guard.Rollback()
+	if err := lockAccountLinkMutation(guard); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- operation() }()
+	select {
+	case err := <-result:
+		t.Fatalf("account-link mutation bypassed advisory lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := guard.Rollback().Error; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(accountLinkLockTimeout + time.Second):
+		t.Fatal("account-link mutation did not resume after advisory lock release")
+	}
+}
+
 func TestPostgresRepositoriesIntegration(t *testing.T) {
 	dsn := os.Getenv("TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -151,6 +277,33 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 	}
 	defer database.Close()
 	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keyRepository := NewClientKeyRepository(database)
+	poolKey, err := keyRepository.Create(ctx, clientkey.Key{Name: "postgres-account-scope", Prefix: "postgres-account-scope", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Migrator().DropColumn(&clientKeyModel{}, "ProviderScopeMask"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Migrator().DropColumn(&clientKeyModel{}, "TierScopeMask"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	loadedPoolKey, err := keyRepository.Get(ctx, poolKey.ID)
+	if err != nil || loadedPoolKey.ProviderScope != clientkey.ProviderScopeAll || loadedPoolKey.TierScope != clientkey.TierScopeAll {
+		t.Fatalf("postgres migrated client key account scope = %+v, err = %v", loadedPoolKey.AccountScope(), err)
+	}
+	loadedPoolKey.ProviderScope = clientkey.ProviderScopeBuild | clientkey.ProviderScopeWeb
+	loadedPoolKey.TierScope = clientkey.TierScopeSuper
+	loadedPoolKey, err = keyRepository.Update(ctx, loadedPoolKey)
+	if err != nil || loadedPoolKey.ProviderScope != clientkey.ProviderScopeBuild|clientkey.ProviderScopeWeb || loadedPoolKey.TierScope != clientkey.TierScopeSuper {
+		t.Fatalf("postgres updated client key account scope = %+v, err = %v", loadedPoolKey.AccountScope(), err)
+	}
+	if err := keyRepository.Delete(ctx, poolKey.ID); err != nil {
 		t.Fatal(err)
 	}
 	verifyPostgresMediaJobInputConstraintUpgrade(t, ctx, database)
@@ -168,6 +321,25 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 	}
 	if err := repository.Delete(ctx, created.ID); err != nil {
 		t.Fatal(err)
+	}
+	firstTokenMS := int64(100)
+	auditCreatedAt := time.Now().UTC()
+	auditRepository := NewAuditRepository(database)
+	if err := auditRepository.Create(ctx, audit.Record{
+		RequestID: "postgres-first-token-" + auditCreatedAt.Format("150405.000000000"), ClientKeyID: 1, ModelRouteID: 1,
+		Provider: "grok_build", Operation: audit.OperationResponses, UsageSource: audit.UsageSourceUpstream,
+		StatusCode: 200, Streaming: true, OutputTokens: 100, TotalTokens: 100, FirstTokenMS: &firstTokenMS, DurationMS: 1100, CreatedAt: auditCreatedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auditRows, _, err := auditRepository.List(ctx, 0, 1)
+	if err != nil || len(auditRows) != 1 || auditRows[0].FirstTokenMS == nil || *auditRows[0].FirstTokenMS != firstTokenMS {
+		t.Fatalf("postgres first-token audit = %#v, err = %v", auditRows, err)
+	}
+	boundaries := testDashboardBoundaries(auditCreatedAt.Add(-time.Hour), time.Hour, 2)
+	dashboardSnapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardWindow(boundaries), auditCreatedAt.Add(time.Hour))
+	if err != nil || dashboardSnapshot.Usage.FirstTokenSamples != 1 || dashboardSnapshot.Usage.ThroughputTokens != 100 || dashboardSnapshot.Usage.GenerationTotalMS != 1000 {
+		t.Fatalf("postgres performance aggregate = %#v, err = %v", dashboardSnapshot.Usage, err)
 	}
 
 	unique := time.Now().UTC().Format("20060102150405.000000000")
@@ -196,9 +368,12 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.ReconcileProviderLinks(ctx, web.ID); err != nil {
-		t.Fatal(err)
-	}
+	assertPostgresAccountLinkMutationWaits(t, ctx, database, func() error {
+		return repository.ReconcileProviderLinks(ctx, web.ID)
+	})
+	assertPostgresAccountLinkMutationWaits(t, ctx, database, func() error {
+		return repository.LinkWebToBuild(ctx, web.ID, build.ID)
+	})
 	web, err = repository.Get(ctx, web.ID)
 	if err != nil || len(web.LinkedAccounts) != 2 {
 		t.Fatalf("postgres linked accounts = %#v, err = %v", web.LinkedAccounts, err)
@@ -237,6 +412,104 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 		if err := repository.Delete(ctx, id); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestPostgresMigratesLegacyClientKeyAccountPoolToScopes(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	ctx := context.Background()
+	database, err := OpenPostgres(ctx, dsn, 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewClientKeyRepository(database)
+	value, err := repository.Create(ctx, clientkey.Key{Name: "postgres-legacy-pool", Prefix: "postgres-legacy-pool", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Exec("ALTER TABLE client_keys DROP COLUMN provider_scope_mask, DROP COLUMN tier_scope_mask").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Exec("ALTER TABLE client_keys ADD COLUMN account_pool text NOT NULL DEFAULT 'all' CHECK (account_pool IN ('all','free','super'))").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Table("client_keys").Where("id = ?", value.ID).Update("account_pool", "free").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repository.Get(ctx, value.ID)
+	if err != nil || stored.ProviderScope != clientkey.ProviderScopeAll || stored.TierScope != clientkey.TierScopeFree {
+		t.Fatalf("migrated PostgreSQL account scope = %+v, err = %v", stored.AccountScope(), err)
+	}
+	if err := repository.Delete(ctx, value.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresUnhealthyEgressCleanupUsesBothAddressFamilies(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, err := OpenPostgres(ctx, dsn, 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx := database.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		t.Fatal(tx.Error)
+	}
+	defer tx.Rollback()
+	testDatabase := &Database{db: tx, dialect: database.dialect}
+
+	nodes := NewEgressRepository(testDatabase)
+	accounts := NewAccountRepository(testDatabase)
+	cipher := egressOperationsCipher(t)
+	prefix := "postgres-cleanup-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	dualStackFailure := createHealthyEgressNode(t, ctx, nodes, cipher, prefix+"-dual", 0)
+	singleStackAvailable := createHealthyEgressNode(t, ctx, nodes, cipher, prefix+"-single", 0)
+	setEgressProbeFamilies(t, ctx, nodes, dualStackFailure, egressdomain.ProbeStatusUnhealthy, egressdomain.ProbeStatusUnhealthy)
+	setEgressProbeFamilies(t, ctx, nodes, singleStackAvailable, egressdomain.ProbeStatusHealthy, egressdomain.ProbeStatusUnhealthy)
+
+	credential := createEgressOperationsAccount(t, ctx, accounts, prefix+"-account")
+	if _, err := accounts.UpdateEgressBindings(ctx, account.ProviderBuild, []uint64{credential.ID}, &dualStackFailure.ID, account.EgressAssignmentManual, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
+	deleted, err := service.DeleteUnhealthy(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted < 1 {
+		t.Fatalf("deleted = %d", deleted)
+	}
+	if _, err := nodes.GetEgressNode(ctx, dualStackFailure.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("dual-stack unhealthy node still exists: %v", err)
+	}
+	if _, err := nodes.GetEgressNode(ctx, singleStackAvailable.ID); err != nil {
+		t.Fatalf("single-stack available node was deleted: %v", err)
+	}
+	stored, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EgressNodeID != 0 || stored.EgressAssignmentMode != "" || stored.EgressAssignedAt != nil {
+		t.Fatalf("account binding not cleared: %#v", stored)
 	}
 }
 
@@ -662,6 +935,102 @@ func assertPostgresAuditSettlement(t *testing.T, ctx context.Context, database *
 	}
 	if billed > 0 && stored.ReservedUsageUSDTicks != 0 {
 		t.Fatalf("reserved usage = %d after settlement", stored.ReservedUsageUSDTicks)
+	}
+}
+
+func TestPostgresRoutingProjectionAndCredentialHydration(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	database, err := OpenPostgres(ctx, dsn, 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close PostgreSQL routing projection database: %v", err)
+		}
+	})
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts := NewAccountRepository(database)
+	now := time.Now().UTC().Truncate(time.Second)
+	unique := strconv.FormatInt(now.UnixNano(), 10)
+	created, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "postgres routing projection",
+		SourceKey: "postgres-routing-projection-" + unique, OIDCClientID: "postgres-client",
+		EncryptedAccessToken: "postgres-access-secret", EncryptedCloudflareCookie: "postgres-cookie-secret",
+		ExpiresAt: now.Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+		Priority: 7, MaxConcurrent: 3, MinimumRemaining: 1.5, WebTier: account.WebTierSuper,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := accounts.Delete(cleanupCtx, created.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
+			t.Errorf("delete PostgreSQL routing projection account: %v", err)
+		}
+	})
+	if err := accounts.SaveBilling(ctx, account.Billing{
+		AccountID: created.ID, PlanCode: "super", MonthlyLimit: 100, Used: 12, SyncedAt: now,
+		History: []account.BillingHistoryEntry{{Year: 2026, Month: 7, IncludedUsed: 12}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resetAt := now.Add(time.Hour)
+	if err := accounts.SaveQuotaWindows(ctx, created.ID, account.WebTierSuper, now, []account.QuotaWindow{{
+		AccountID: created.ID, Mode: "weekly", Remaining: 10, Total: 20, UsagePercent: 50,
+		Breakdown:     []account.QuotaBreakdown{{ProductCode: account.QuotaProductChat, UsagePercent: 50}},
+		WindowSeconds: 3600, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	bases, err := accounts.ListRoutingAccountBases(ctx, account.ProviderWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected *account.RoutingAccountBase
+	for index := range bases {
+		if bases[index].Credential.ID == created.ID {
+			projected = &bases[index]
+			break
+		}
+	}
+	if projected == nil {
+		t.Fatalf("routing projection account %d not found", created.ID)
+	}
+	assertRoutingProjection(t, projected.Credential, created)
+	if projected.Billing == nil || projected.Billing.PlanCode != "super" || len(projected.Billing.History) != 0 {
+		t.Fatalf("routing billing = %#v, want scalar billing without history", projected.Billing)
+	}
+	if projected.QuotaWindow == nil || projected.QuotaWindow.Remaining != 10 || len(projected.QuotaWindow.Breakdown) != 0 {
+		t.Fatalf("routing quota = %#v, want scalar quota without breakdown", projected.QuotaWindow)
+	}
+
+	material, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if material.Provider != account.ProviderWeb || material.EncryptedAccessToken != "postgres-access-secret" || material.EncryptedCloudflareCookie != "postgres-cookie-secret" {
+		t.Fatalf("credential material = %#v", material)
+	}
+	if _, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderBuild); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("cross-provider credential error = %v, want ErrNotFound", err)
+	}
+	disabled := false
+	if _, err := accounts.UpdateMany(ctx, account.ProviderBuild, []uint64{created.ID}, repository.AccountUpdates{Enabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderWeb); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("disabled credential error = %v, want ErrNotFound", err)
 	}
 }
 

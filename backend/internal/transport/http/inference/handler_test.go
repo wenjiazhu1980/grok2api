@@ -13,7 +13,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/gin-gonic/gin"
 )
@@ -162,6 +164,34 @@ func TestGatewayErrorMapsLedgerUnavailableToServiceUnavailable(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"code":"ledger_unavailable"`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGatewayErrorMapsDisallowedModelWithoutCallingItUpstreamUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name      string
+		anthropic bool
+		wantType  string
+	}{
+		{name: "openai", wantType: `"code":"model_not_allowed"`},
+		{name: "anthropic", anthropic: true, wantType: `"type":"permission_error"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/", func(c *gin.Context) {
+				if test.anthropic {
+					writeGatewayAnthropicError(c, clientkeyapp.ErrModelNotAllowed)
+					return
+				}
+				writeGatewayError(c, clientkeyapp.ErrModelNotAllowed)
+			})
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), test.wantType) || strings.Contains(recorder.Body.String(), "upstream_unavailable") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
@@ -601,6 +631,110 @@ func TestStreamInspectorMergesCachedTokensAcrossFrames(t *testing.T) {
 	}
 }
 
+func TestStreamInspectorMarksFirstGeneratedTokenOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol streamProtocol
+		prelude  string
+		delta    string
+	}{
+		{
+			name: "responses text", protocol: streamProtocolResponses,
+			prelude: `data: {"type":"response.created","response":{"id":"resp_1"}}` + "\n\n" + `data: {"type":"response.output_text.delta","delta":""}` + "\n\n",
+			delta:   `data: {"type":"response.output_text.delta","delta":"hello"}` + "\n\n",
+		},
+		{
+			name: "responses custom tool input", protocol: streamProtocolResponses,
+			prelude: `data: {"type":"response.custom_tool_call_input.delta","output_index":1,"item_id":"ctc_1","delta":""}` + "\n\n",
+			delta:   `data: {"type":"response.custom_tool_call_input.delta","output_index":1,"item_id":"ctc_1","delta":"{}"}` + "\n\n",
+		},
+		{
+			name: "chat reasoning", protocol: streamProtocolChat,
+			prelude: `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n",
+			delta:   `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}` + "\n\n",
+		},
+		{
+			name: "anthropic tool input", protocol: streamProtocolAnthropic,
+			prelude: `data: {"type":"message_start","message":{"id":"msg_1"}}` + "\n\n",
+			delta:   `data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}` + "\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			marked := 0
+			inspector := &responseInspector{protocol: test.protocol, onFirstToken: func() { marked++ }}
+			inspector.Inspect([]byte(test.prelude))
+			inspector.markFirstTokenForwarded()
+			if marked != 0 {
+				t.Fatalf("metadata marked first token %d times", marked)
+			}
+			inspector.Inspect([]byte(test.delta + test.delta))
+			if marked != 0 {
+				t.Fatalf("generated delta was marked before forwarding %d times", marked)
+			}
+			inspector.markFirstTokenForwarded()
+			inspector.markFirstTokenForwarded()
+			if marked != 1 {
+				t.Fatalf("generated delta marked first token %d times", marked)
+			}
+		})
+	}
+}
+
+func TestStreamInspectorDoesNotMarkImageEvents(t *testing.T) {
+	marked := 0
+	inspector := &responseInspector{protocol: streamProtocolImage, onFirstToken: func() { marked++ }}
+	inspector.Inspect([]byte(`data: {"type":"image_generation.partial_image","partial_image_b64":"abc"}` + "\n\n"))
+	inspector.markFirstTokenForwarded()
+	if marked != 0 {
+		t.Fatalf("image stream marked first token %d times", marked)
+	}
+}
+
+func TestCopyStreamMarksFirstTokenAfterFlush(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := `data: {"type":"response.reasoning_text.delta","delta":"thinking"}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"usage":{"output_tokens":1}}}` + "\n\n"
+	marked := 0
+	_, err := copyStream(context.Writer, strings.NewReader(body), streamProtocolResponses, func() {
+		marked++
+		if !recorder.Flushed || !strings.Contains(recorder.Body.String(), `"delta":"thinking"`) {
+			t.Fatalf("first token was marked before the generated delta was flushed: flushed=%v body=%q", recorder.Flushed, recorder.Body.String())
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked != 1 {
+		t.Fatalf("first token marked %d times", marked)
+	}
+}
+
+func BenchmarkFirstTokenInspection(b *testing.B) {
+	tests := []struct {
+		name     string
+		protocol streamProtocol
+		data     []byte
+	}{
+		{name: "responses", protocol: streamProtocolResponses, data: []byte(`{"type":"response.output_text.delta","delta":"hello"}`)},
+		{name: "responses custom tool", protocol: streamProtocolResponses, data: []byte(`{"type":"response.custom_tool_call_input.delta","delta":"{}"}`)},
+		{name: "chat", protocol: streamProtocolChat, data: []byte(`{"choices":[{"delta":{"content":"hello"}}]}`)},
+		{name: "anthropic", protocol: streamProtocolAnthropic, data: []byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`)},
+	}
+	for _, test := range tests {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if !containsGeneratedDelta(test.data, test.protocol) {
+					b.Fatal("generated delta not detected")
+				}
+			}
+		})
+	}
+}
+
 func TestAnthropicUsageReconstructsCacheCreationAndSaturates(t *testing.T) {
 	metadata := responseMetadata{
 		Usage:                    gateway.Usage{InputTokens: 20, CachedInputTokens: 70, OutputTokens: 5},
@@ -704,7 +838,7 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(recorder)
-			metadata, err := copyStream(context.Writer, strings.NewReader(test.body), test.protocol)
+			metadata, err := copyStream(context.Writer, strings.NewReader(test.body), test.protocol, nil)
 			if test.wantErr == nil && err != nil {
 				t.Fatal(err)
 			}
@@ -850,6 +984,7 @@ func TestSelectionErrorResponseDistinguishesCoolingAndSaturation(t *testing.T) {
 		{name: "cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionCooling, RetryAfter: 1500 * time.Millisecond}, status: http.StatusTooManyRequests, code: "upstream_cooling", retryAfter: "2"},
 		{name: "model cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionModelCooling, RetryAfter: time.Second}, status: http.StatusTooManyRequests, code: "upstream_model_cooling", retryAfter: "1"},
 		{name: "saturated", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionSaturated, RetryAfter: time.Second}, status: http.StatusServiceUnavailable, code: "upstream_saturated", retryAfter: "1"},
+		{name: "scoped account range", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionNoAccounts, Scope: clientkeydomain.AccountScope{Providers: clientkeydomain.ProviderScopeBuild, Tiers: clientkeydomain.TierScopeFree}}, status: http.StatusServiceUnavailable, code: "client_key_account_scope_unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

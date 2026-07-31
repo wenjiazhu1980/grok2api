@@ -23,7 +23,10 @@ func NewHandler(service *egressapp.Service) *Handler { return &Handler{service: 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-nodes", h.list)
 	router.POST("/egress-nodes", h.create)
+	router.PATCH("/egress-nodes/batch", h.updateMany)
 	router.DELETE("/egress-nodes", h.deleteMany)
+	router.GET("/egress-nodes/cleanup-preview", h.cleanupPreview)
+	router.POST("/egress-nodes/cleanup", h.cleanup)
 	router.POST("/egress-nodes/test", h.testNodes)
 	router.POST("/egress-nodes/:id/test", h.testNode)
 	router.POST("/egress-nodes/:id/accounts", h.assignAccounts)
@@ -40,6 +43,26 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-operations", h.operationsConfig)
 	router.PUT("/egress-operations", h.updateOperationsConfig)
 	router.POST("/egress-operations/rebalance", h.rebalance)
+}
+
+func (h *Handler) cleanupPreview(c *gin.Context) {
+	value, err := h.service.PreviewUnhealthyCleanup(c.Request.Context())
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"nodes": value.Nodes, "boundAccounts": value.BoundAccounts, "subscriptionManaged": value.SubscriptionManaged,
+	})
+}
+
+func (h *Handler) cleanup(c *gin.Context) {
+	deleted, err := h.service.DeleteUnhealthy(c.Request.Context())
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
 }
 
 func (h *Handler) refreshClearance(c *gin.Context) {
@@ -68,27 +91,38 @@ type nodeRequest struct {
 }
 
 type nodeResponse struct {
-	ID                   uint64     `json:"id,string"`
-	Name                 string     `json:"name"`
-	Scope                string     `json:"scope"`
-	Enabled              bool       `json:"enabled"`
-	ProxyConfigured      bool       `json:"proxyConfigured"`
-	ProxyPool            bool       `json:"proxyPool"`
-	SourceID             uint64     `json:"sourceId,omitempty,string"`
-	AccountCapacity      int        `json:"accountCapacity"`
-	UserAgent            string     `json:"userAgent"`
-	CookieConfigured     bool       `json:"cookieConfigured"`
-	AccountBoundProxy    bool       `json:"accountBoundProxy"`
-	Health               float64    `json:"health"`
-	FailureCount         int        `json:"failureCount"`
-	CooldownUntil        *time.Time `json:"cooldownUntil,omitempty"`
-	LastError            string     `json:"lastError,omitempty"`
-	ProbeStatus          string     `json:"probeStatus"`
-	LastProbedAt         *time.Time `json:"lastProbedAt,omitempty"`
-	ProbeLatencyMS       int        `json:"probeLatencyMs"`
-	ExitIP               string     `json:"exitIp,omitempty"`
-	ProbeError           string     `json:"probeError,omitempty"`
-	AssignedAccountCount int        `json:"assignedAccountCount"`
+	ID                   uint64              `json:"id,string"`
+	Name                 string              `json:"name"`
+	Scope                string              `json:"scope"`
+	Enabled              bool                `json:"enabled"`
+	ProxyConfigured      bool                `json:"proxyConfigured"`
+	ProxyPool            bool                `json:"proxyPool"`
+	SourceID             uint64              `json:"sourceId,omitempty,string"`
+	AccountCapacity      int                 `json:"accountCapacity"`
+	UserAgent            string              `json:"userAgent"`
+	CookieConfigured     bool                `json:"cookieConfigured"`
+	AccountBoundProxy    bool                `json:"accountBoundProxy"`
+	Health               float64             `json:"health"`
+	FailureCount         int                 `json:"failureCount"`
+	CooldownUntil        *time.Time          `json:"cooldownUntil,omitempty"`
+	LastError            string              `json:"lastError,omitempty"`
+	ProbeStatus          string              `json:"probeStatus"`
+	LastProbedAt         *time.Time          `json:"lastProbedAt,omitempty"`
+	ProbeLatencyMS       int                 `json:"probeLatencyMs"`
+	ExitIP               string              `json:"exitIp,omitempty"`
+	ProbeError           string              `json:"probeError,omitempty"`
+	ProbeProvider        string              `json:"probeProvider,omitempty"`
+	IPv4Probe            probeFamilyResponse `json:"ipv4Probe"`
+	IPv6Probe            probeFamilyResponse `json:"ipv6Probe"`
+	AssignedAccountCount int                 `json:"assignedAccountCount"`
+}
+
+type probeFamilyResponse struct {
+	Status    string     `json:"status"`
+	TestedAt  *time.Time `json:"testedAt,omitempty"`
+	LatencyMS int        `json:"latencyMs"`
+	ExitIP    string     `json:"exitIp,omitempty"`
+	Error     string     `json:"error,omitempty"`
 }
 
 type accountAssignmentRequest struct {
@@ -101,14 +135,38 @@ type batchNodeDeleteRequest struct {
 	IDs []string `json:"ids" binding:"required"`
 }
 
+type batchNodeUpdateRequest struct {
+	IDs     []string `json:"ids" binding:"required"`
+	Enabled *bool    `json:"enabled" binding:"required"`
+}
+
+func (h *Handler) updateMany(c *gin.Context) {
+	var request batchNodeUpdateRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseBoundedEgressNodeIDs(request.IDs, 5000)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", "代理节点 ID 无效")
+		return
+	}
+	updated, err := h.service.UpdateManyEnabled(c.Request.Context(), ids, *request.Enabled)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"updated": updated})
+}
+
 func (h *Handler) deleteMany(c *gin.Context) {
 	var request batchNodeDeleteRequest
 	if c.ShouldBindJSON(&request) != nil {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	ids, err := parseEgressNodeIDs(request.IDs)
-	if err != nil || len(ids) > 5000 {
+	ids, err := parseBoundedEgressNodeIDs(request.IDs, 5000)
+	if err != nil {
 		response.Error(c, http.StatusBadRequest, "invalidId", "代理节点 ID 无效")
 		return
 	}
@@ -177,24 +235,66 @@ func (value nodeRequest) input() egressapp.Input {
 
 func (h *Handler) list(c *gin.Context) {
 	scope := egressdomain.Scope(c.Query("scope"))
-	if scope != "" && scope != egressdomain.ScopeBuild && scope != egressdomain.ScopeWeb && scope != egressdomain.ScopeConsole && scope != egressdomain.ScopeWebAsset {
-		response.Error(c, http.StatusBadRequest, "invalidEgressScope", "scope 必须是 grok_build、grok_web、grok_console 或 grok_web_asset")
+	sort := repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}
+	if legacyEgressListRequest(c) {
+		values, err := h.service.ListAll(c.Request.Context(), scope, sort)
+		if h.writeListError(c, err) {
+			return
+		}
+		items := make([]nodeResponse, 0, len(values))
+		for _, value := range values {
+			items = append(items, newNodeResponse(value))
+		}
+		pageSize := len(items)
+		if pageSize == 0 {
+			pageSize = repository.DefaultPageSize
+		}
+		response.Success(c, http.StatusOK, gin.H{"items": items, "page": 1, "pageSize": pageSize, "total": len(items), "defaultUserAgents": h.service.DefaultUserAgents()})
 		return
 	}
-	values, err := h.service.List(c.Request.Context(), scope, repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))})
-	if errors.Is(err, egressapp.ErrInvalidSort) {
-		response.Error(c, http.StatusBadRequest, "invalidSort", err.Error())
-		return
-	}
-	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "egressNodeListFailed", "读取代理节点失败")
+	page, pageSize := nodePagination(c)
+	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), egressapp.ListFilter{
+		Scope: scope, Enabled: c.Query("enabled"), ProbeStatus: c.Query("probe"), Assignment: c.Query("assignment"),
+		Sort: sort,
+	})
+	if h.writeListError(c, err) {
 		return
 	}
 	items := make([]nodeResponse, 0, len(values))
 	for _, value := range values {
 		items = append(items, newNodeResponse(value))
 	}
-	response.Success(c, http.StatusOK, gin.H{"items": items, "defaultUserAgents": h.service.DefaultUserAgents()})
+	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total, "defaultUserAgents": h.service.DefaultUserAgents()})
+}
+
+func legacyEgressListRequest(c *gin.Context) bool {
+	if _, exists := c.GetQuery("page"); exists {
+		return false
+	}
+	if _, exists := c.GetQuery("pageSize"); exists {
+		return false
+	}
+	return c.Query("search") == "" && c.Query("enabled") == "" && c.Query("probe") == "" && c.Query("assignment") == ""
+}
+
+func (h *Handler) writeListError(c *gin.Context, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, egressapp.ErrInvalidFilter):
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+	case errors.Is(err, egressapp.ErrInvalidSort):
+		response.Error(c, http.StatusBadRequest, "invalidSort", err.Error())
+	default:
+		response.Error(c, http.StatusInternalServerError, "egressNodeListFailed", "读取代理节点失败")
+	}
+	return true
+}
+
+func nodePagination(c *gin.Context) (int, int) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+	return repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 }
 
 func (h *Handler) create(c *gin.Context) {
@@ -237,7 +337,24 @@ func newNodeResponse(value egressdomain.PublicNode) nodeResponse {
 		SourceID:          value.SourceID, AccountCapacity: value.AccountCapacity,
 		Health: value.Health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,
 		ProbeStatus: string(value.ProbeStatus), LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeProvider: string(value.ProbeProvider),
+		IPv4Probe:     newProbeFamilyResponse(value.IPv4Probe), IPv6Probe: newProbeFamilyResponse(value.IPv6Probe),
 		AssignedAccountCount: value.AssignedAccountCount,
+	}
+}
+
+func newProbeFamilyResponse(value egressdomain.ProbeFamilyResult) probeFamilyResponse {
+	status := value.Status
+	if !status.IsValid() {
+		status = egressdomain.ProbeStatusUnknown
+	}
+	var testedAt *time.Time
+	if !value.TestedAt.IsZero() {
+		canonical := value.TestedAt.UTC()
+		testedAt = &canonical
+	}
+	return probeFamilyResponse{
+		Status: string(status), TestedAt: testedAt, LatencyMS: value.LatencyMS, ExitIP: value.ExitIP, Error: value.Error,
 	}
 }
 
@@ -279,6 +396,13 @@ func parseEgressNodeIDs(values []string) ([]uint64, error) {
 		return nil, errors.New("no ids")
 	}
 	return result, nil
+}
+
+func parseBoundedEgressNodeIDs(values []string, limit int) ([]uint64, error) {
+	if len(values) == 0 || limit < 1 || len(values) > limit {
+		return nil, errors.New("invalid id count")
+	}
+	return parseEgressNodeIDs(values)
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -329,6 +453,7 @@ type probeBatchRequest struct {
 }
 
 type operationsConfigRequest struct {
+	ProbeProvider             string                               `json:"probeProvider"`
 	ProbeIntervalSeconds      int                                  `json:"probeIntervalSeconds"`
 	AutoAssignEnabled         bool                                 `json:"autoAssignEnabled"`
 	AutoBalanceEnabled        bool                                 `json:"autoBalanceEnabled"`
@@ -342,6 +467,7 @@ type operationsFallbackRequest struct {
 }
 
 type operationsConfigResponse struct {
+	ProbeProvider             string                                `json:"probeProvider"`
 	ProbeIntervalSeconds      int                                   `json:"probeIntervalSeconds"`
 	AutoAssignEnabled         bool                                  `json:"autoAssignEnabled"`
 	AutoBalanceEnabled        bool                                  `json:"autoBalanceEnabled"`
@@ -357,7 +483,7 @@ type operationsFallbackResponse struct {
 
 func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, error) {
 	result := egressapp.OperationsConfigInput{
-		ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
+		ProbeProvider: egressdomain.ProbeProvider(strings.TrimSpace(value.ProbeProvider)), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
 	}
 	if value.Fallbacks == nil {
@@ -406,7 +532,7 @@ func newOperationsConfigResponse(value egressdomain.OperationsConfig) operations
 		fallbacks[string(scope)] = item
 	}
 	return operationsConfigResponse{
-		ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
+		ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
 		Fallbacks: fallbacks, UpdatedAt: value.UpdatedAt,
 	}
@@ -508,7 +634,11 @@ func (h *Handler) testNode(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{"status": value.Status, "testedAt": value.TestedAt, "latencyMs": value.LatencyMS, "exitIp": value.ExitIP, "error": value.Error})
+	response.Success(c, http.StatusOK, gin.H{
+		"status": value.Status, "testedAt": value.TestedAt, "latencyMs": value.LatencyMS, "exitIp": value.ExitIP, "error": value.Error,
+		"probeProvider": value.Provider,
+		"ipv4":          newProbeFamilyResponse(value.IPv4), "ipv6": newProbeFamilyResponse(value.IPv6),
+	})
 }
 
 func (h *Handler) testNodes(c *gin.Context) {
@@ -585,6 +715,8 @@ func (h *Handler) writeError(c *gin.Context, err error) {
 		response.Error(c, http.StatusBadRequest, "invalidEgressNode", err.Error())
 	case errors.Is(err, egressapp.ErrNotFound):
 		response.Error(c, http.StatusNotFound, "egressNodeNotFound", err.Error())
+	case errors.Is(err, egressapp.ErrProbeStale):
+		response.Error(c, http.StatusConflict, "egressProbeStale", err.Error())
 	case errors.Is(err, repository.ErrConflict):
 		response.Error(c, http.StatusConflict, "egressConflict", "名称已存在")
 	case errors.Is(err, egressapp.ErrOperationsUnavailable):

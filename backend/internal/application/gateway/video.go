@@ -67,7 +67,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	}
 	externalModel := model.ExternalPublicID(route.Provider, route.PublicID)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	lease, err := s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", nil, false)
+	lease, err := s.selector.AcquireForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", nil, false, input.ClientKey.AccountScope())
 	if err != nil {
 		return media.Job{}, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 	}
@@ -301,6 +301,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		return
 	}
 	defer lease.Release()
+	credential, err := s.accounts.EnsureCredential(ctx, lease.Credential, false)
+	if err != nil {
+		s.failVideoJob(parent, job, "account_unavailable", err)
+		return
+	}
+	lease.Credential = credential
 	adapter, ok := s.providers.Videos(route.Provider)
 	if !ok {
 		s.failVideoJob(parent, job, "provider_unavailable", ErrNoAvailableAccount)
