@@ -27,6 +27,7 @@ var ErrOperationsUnavailable = errors.New("代理运营功能不可用")
 // provides this richer administrative surface.
 type OperationsRepository interface {
 	ListEgressSources(context.Context) ([]domain.SubscriptionSource, error)
+	ListEgressSourcePage(context.Context, repository.EgressSourceListQuery) ([]domain.SubscriptionSource, int64, error)
 	ListDueEgressSources(context.Context, time.Time, int) ([]domain.SubscriptionSource, error)
 	GetEgressSource(context.Context, uint64) (domain.SubscriptionSource, error)
 	CreateEgressSource(context.Context, domain.SubscriptionSource) (domain.SubscriptionSource, error)
@@ -57,8 +58,14 @@ type SubscriptionSourceInput struct {
 	Enabled                bool
 	URL                    *string
 	ClearURL               bool
+	ProxyURL               *string
+	ClearProxyURL          bool
 	RefreshIntervalSeconds *int
 	DefaultAccountCapacity *int
+}
+
+type SourceListFilter struct {
+	Scope domain.Scope
 }
 
 type ImportInput struct {
@@ -141,6 +148,29 @@ func (s *Service) ListSources(ctx context.Context) ([]domain.PublicSubscriptionS
 		result = append(result, publicSource(value))
 	}
 	return result, nil
+}
+
+func (s *Service) ListSourcePage(ctx context.Context, page, pageSize int, search string, filter SourceListFilter) ([]domain.PublicSubscriptionSource, int64, error) {
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
+	if !validListScope(filter.Scope) {
+		return nil, 0, ErrInvalidFilter
+	}
+	operations, err := s.operationsRepository()
+	if err != nil {
+		return nil, 0, err
+	}
+	values, total, err := operations.ListEgressSourcePage(ctx, repository.EgressSourceListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search)},
+		Filter: repository.EgressSourceListFilter{Scope: filter.Scope},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	result := make([]domain.PublicSubscriptionSource, 0, len(values))
+	for _, value := range values {
+		result = append(result, publicSource(value))
+	}
+	return result, total, nil
 }
 
 func (s *Service) CreateSource(ctx context.Context, input SubscriptionSourceInput) (domain.PublicSubscriptionSource, error) {
@@ -395,8 +425,8 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 }
 
 func (s *Service) validateFallbacks(ctx context.Context, current domain.OperationsConfig, input map[domain.Scope]FallbackConfigInput) (map[domain.Scope]domain.FallbackConfig, error) {
-	result := make(map[domain.Scope]domain.FallbackConfig, 4)
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	result := make(map[domain.Scope]domain.FallbackConfig, len(allOperationScopes()))
+	for _, scope := range allOperationScopes() {
 		result[scope] = current.FallbackFor(scope)
 	}
 	for scope, fallback := range input {
@@ -499,7 +529,26 @@ func (s *Service) applySourceInput(value domain.SubscriptionSource, input Subscr
 	if create && value.EncryptedURL == "" {
 		return domain.SubscriptionSource{}, fmt.Errorf("%w: 必须提供订阅地址", ErrInvalidInput)
 	}
-	if create || input.URL != nil || input.ClearURL {
+	if input.ClearProxyURL {
+		value.EncryptedProxyURL = ""
+	} else if input.ProxyURL != nil {
+		proxyURL, err := NormalizeProxyURL(*input.ProxyURL)
+		if err != nil {
+			return domain.SubscriptionSource{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+		}
+		if proxyURL == "" {
+			return domain.SubscriptionSource{}, fmt.Errorf("%w: 订阅代理地址不能为空", ErrInvalidInput)
+		}
+		if strings.Contains(proxyURL, ProxyAccountPlaceholder) {
+			return domain.SubscriptionSource{}, fmt.Errorf("%w: 订阅代理地址不能包含账号占位符", ErrInvalidInput)
+		}
+		encryptedProxyURL, err := s.cipher.Encrypt(proxyURL)
+		if err != nil {
+			return domain.SubscriptionSource{}, err
+		}
+		value.EncryptedProxyURL = encryptedProxyURL
+	}
+	if create || input.URL != nil || input.ClearURL || input.ProxyURL != nil || input.ClearProxyURL {
 		value.NextSyncAt = nil
 		value.LastSyncError = ""
 	}
@@ -509,6 +558,7 @@ func (s *Service) applySourceInput(value domain.SubscriptionSource, input Subscr
 func publicSource(value domain.SubscriptionSource) domain.PublicSubscriptionSource {
 	return domain.PublicSubscriptionSource{
 		ID: value.ID, Name: value.Name, Scope: value.Scope, Enabled: value.Enabled, URLConfigured: value.EncryptedURL != "",
+		ProxyConfigured:        value.EncryptedProxyURL != "",
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 		LastSyncedAt: value.LastSyncedAt, NextSyncAt: value.NextSyncAt, LastSyncImported: value.LastSyncImported, LastSyncError: value.LastSyncError,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -516,7 +566,11 @@ func publicSource(value domain.SubscriptionSource) domain.PublicSubscriptionSour
 }
 
 func validScope(scope domain.Scope) bool {
-	return scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset
+	return scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset || scope == domain.ScopeConsoleAsset
+}
+
+func allOperationScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func validateImportInput(input ImportInput) error {

@@ -211,19 +211,28 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
-		return provider.VideoResult{}, err
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	lease, err := a.egress.AcquireCredential(ctx, domainegress.ScopeWeb, request.Credential)
 	if err != nil {
-		return provider.VideoResult{}, err
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	defer lease.Release()
 	parentID := ""
-	references := make([]string, 0, len(request.ReferenceURLs))
+	rawReferences := make([]string, 0, 1+len(request.ReferenceURLs))
+	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
+		rawReferences = append(rawReferences, imageURL)
+	}
 	for _, rawReference := range request.ReferenceURLs {
+		if value := strings.TrimSpace(rawReference); value != "" {
+			rawReferences = append(rawReferences, value)
+		}
+	}
+	references := make([]string, 0, len(rawReferences))
+	for _, rawReference := range rawReferences {
 		reference, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
 		if referenceErr != nil {
-			return provider.VideoResult{}, referenceErr
+			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(referenceErr), 0, referenceErr)
 		}
 		references = append(references, reference)
 	}
@@ -233,11 +242,11 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt, "video_prompt_media_post")
 	}
 	if err != nil {
-		return provider.VideoResult{}, err
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
 	segments := videoSegments(request.Duration)
 	if len(segments) == 0 {
-		return provider.VideoResult{}, fmt.Errorf("duration 必须在 1 到 15 秒之间")
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
 	}
 	ratio := resolveAspectRatio(request.AspectRatio)
 	resolution := request.Resolution
@@ -247,7 +256,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	payload := videoCreatePayload(request.Prompt, parentID, ratio, resolution, segments[0], references)
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
-		return provider.VideoResult{}, err
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
 	result, _, parseErr := parseVideoStream(response, request.Progress)
 	_ = response.Body.Close()
@@ -255,10 +264,14 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
 			a.logWebMediaUpstreamRejection("video_generation", response, upstreamErr)
 		}
-		return provider.VideoResult{}, parseErr
+		stage := provider.VideoStagePoll
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			stage = provider.VideoCreateFailureStage(parseErr)
+		}
+		return provider.VideoResult{}, provider.WrapVideoStage(stage, 0, parseErr)
 	}
 	if result.URL == "" {
-		return provider.VideoResult{}, fmt.Errorf("视频生成完成但没有返回内容 URL")
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePoll, 0, fmt.Errorf("视频生成完成但没有返回内容 URL"))
 	}
 	return result, nil
 }
@@ -280,20 +293,6 @@ func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *
 		return "", fmt.Errorf("上传视频参考图片后未返回 fileUri")
 	}
 	return uploaded.URI, nil
-}
-
-type videoContentReadCloser struct {
-	io.ReadCloser
-	release func()
-}
-
-func (c *videoContentReadCloser) Close() error {
-	err := c.ReadCloser.Close()
-	if c.release != nil {
-		c.release()
-		c.release = nil
-	}
-	return err
 }
 
 // DownloadVideo retrieves a completed Grok asset through its source SSO
@@ -323,11 +322,13 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 	request.Header.Del("Content-Type")
 	response, err := lease.Do(request)
 	if err != nil {
+		a.egress.FeedbackForScope(context.WithoutCancel(ctx), domainegress.ScopeWebAsset, lease.NodeID, 0, err)
 		lease.Release()
 		return nil, "", 0, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
+		a.egress.FeedbackForScope(context.WithoutCancel(ctx), domainegress.ScopeWebAsset, lease.NodeID, response.StatusCode, nil)
 		lease.Release()
 		return nil, "", 0, fmt.Errorf("下载视频返回 %d", response.StatusCode)
 	}
@@ -340,7 +341,15 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 		lease.Release()
 		return nil, "", 0, fmt.Errorf("上游视频 Content-Type 无效")
 	}
-	return &videoContentReadCloser{ReadCloser: response.Body, release: lease.Release}, contentType, response.ContentLength, nil
+	onFinished := func(readErr error, complete bool) {
+		if readErr != nil {
+			a.egress.FeedbackForScope(context.WithoutCancel(ctx), domainegress.ScopeWebAsset, lease.NodeID, 0, readErr)
+		} else if complete {
+			a.egress.FeedbackForScope(context.WithoutCancel(ctx), domainegress.ScopeWebAsset, lease.NodeID, response.StatusCode, nil)
+		}
+		lease.Release()
+	}
+	return provider.NewCompletionReadCloser(response.Body, onFinished), contentType, response.ContentLength, nil
 }
 
 func parseVideoStream(response *http.Response, progress func(int)) (provider.VideoResult, string, error) {

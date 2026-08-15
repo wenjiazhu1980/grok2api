@@ -1,11 +1,14 @@
 package model
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
@@ -18,10 +21,16 @@ import (
 
 type Handler struct{ service *modelapp.Service }
 
+const (
+	modelSyncHeartbeatInterval = 15 * time.Second
+	modelSyncWriteTimeout      = 30 * time.Second
+)
+
 func NewHandler(service *modelapp.Service) *Handler { return &Handler{service: service} }
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/models", h.list)
+	router.GET("/models/groups", h.listGroups)
 	router.GET("/models/accounts", h.listAccounts)
 	router.POST("/models", h.create)
 	router.POST("/models/sync", h.sync)
@@ -73,6 +82,12 @@ type modelResponse struct {
 	LastSyncedAt      *time.Time `json:"lastSyncedAt,omitempty"`
 }
 
+type modelGroupResponse struct {
+	Key                  string          `json:"key"`
+	Routes               []modelResponse `json:"routes"`
+	EndpointCapabilities []string        `json:"endpointCapabilities"`
+}
+
 type accountOptionResponse struct {
 	ID   uint64 `json:"id,string"`
 	Name string `json:"name"`
@@ -97,6 +112,27 @@ func (h *Handler) list(c *gin.Context) {
 	items := make([]modelResponse, 0, len(values))
 	for _, value := range values {
 		items = append(items, newModelResponse(value))
+	}
+	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+func (h *Handler) listGroups(c *gin.Context) {
+	page, pageSize := pagination(c)
+	values, total, err := h.service.ListGroups(c.Request.Context(), page, pageSize, c.Query("search"), modelapp.ListFilter{
+		Provider: c.Query("provider"), Status: c.Query("status"),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
+	if errors.Is(err, modelapp.ErrInvalidFilter) {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "modelListFailed", "读取模型能力组失败")
+		return
+	}
+	items := make([]modelGroupResponse, 0, len(values))
+	for _, value := range values {
+		items = append(items, newModelGroupResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
 }
@@ -206,12 +242,94 @@ func (h *Handler) batchDelete(c *gin.Context) {
 }
 
 func (h *Handler) sync(c *gin.Context) {
-	count, err := h.service.Sync(c.Request.Context())
-	if err != nil {
-		response.Error(c, http.StatusBadGateway, "modelSyncFailed", "同步上游模型失败")
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("X-Accel-Buffering", "no")
+	if err := writeModelSyncComment(c, "connected"); err != nil {
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{"synced": count})
+
+	type syncResult struct {
+		synced int
+		err    error
+	}
+	result := make(chan syncResult, 1)
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	var completed atomic.Int64
+	var total atomic.Int64
+	go func() {
+		synced, err := h.service.SyncObserved(ctx, func(current, maximum int) {
+			completed.Store(int64(current))
+			total.Store(int64(maximum))
+		})
+		result <- syncResult{synced: synced, err: err}
+	}()
+
+	heartbeat := time.NewTicker(modelSyncHeartbeatInterval)
+	defer heartbeat.Stop()
+	progressTicker := time.NewTicker(250 * time.Millisecond)
+	defer progressTicker.Stop()
+	lastCompleted, lastTotal := -1, -1
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case value := <-result:
+			if value.err != nil {
+				_ = writeModelSyncEvent(c, "error", gin.H{"code": "modelSyncFailed", "message": "同步模型能力失败"})
+				return
+			}
+			_ = writeModelSyncEvent(c, "complete", gin.H{"synced": value.synced})
+			return
+		case <-heartbeat.C:
+			if err := writeModelSyncComment(c, "heartbeat"); err != nil {
+				return
+			}
+		case <-progressTicker.C:
+			current, maximum := int(completed.Load()), int(total.Load())
+			if maximum > 0 && (current != lastCompleted || maximum != lastTotal) {
+				if err := writeModelSyncEvent(c, "progress", gin.H{"completed": current, "total": maximum}); err != nil {
+					return
+				}
+				lastCompleted, lastTotal = current, maximum
+			}
+		}
+	}
+}
+
+func writeModelSyncEvent(c *gin.Context, event string, value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if err := setModelSyncWriteDeadline(c.Writer); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+		return err
+	}
+	c.Writer.Flush()
+	return c.Request.Context().Err()
+}
+
+func writeModelSyncComment(c *gin.Context, comment string) error {
+	if err := setModelSyncWriteDeadline(c.Writer); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.Writer, ": %s\n\n", comment); err != nil {
+		return err
+	}
+	c.Writer.Flush()
+	return c.Request.Context().Err()
+}
+
+func setModelSyncWriteDeadline(writer http.ResponseWriter) error {
+	err := http.NewResponseController(writer).SetWriteDeadline(time.Now().Add(modelSyncWriteTimeout))
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -271,7 +389,9 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error) {
 
 func newModelResponse(value modeldomain.Route) modelResponse {
 	manualBinding := len(value.BoundAccountIDs) > 0
-	capabilityKnown := manualBinding || value.SyncedAccounts > 0
+	// Console uses a provider-wide static catalog, so catalog support is known
+	// even when an account capability snapshot predates a newly shipped model.
+	capabilityKnown := manualBinding || value.SyncedAccounts > 0 || (value.Provider == account.ProviderConsole && (value.Origin == modeldomain.OriginCatalog || value.SupportedAccounts > 0))
 	available := value.TotalAccounts > 0 && (value.SupportedAccounts > 0 || (!manualBinding && value.SyncedAccounts < value.TotalAccounts))
 	accountIDs := make([]string, 0, len(value.BoundAccountIDs))
 	for _, id := range value.BoundAccountIDs {
@@ -283,6 +403,16 @@ func newModelResponse(value modeldomain.Route) modelResponse {
 		SyncedAccounts: value.SyncedAccounts, TotalAccounts: value.TotalAccounts, CapabilityKnown: capabilityKnown,
 		Available: available, LastSyncedAt: value.LastSyncedAt,
 	}
+}
+
+func newModelGroupResponse(value modelapp.RouteGroup) modelGroupResponse {
+	routes := make([]modelResponse, 0, len(value.Routes))
+	ids := make([]string, 0, len(value.Routes))
+	for _, route := range value.Routes {
+		routes = append(routes, newModelResponse(route))
+		ids = append(ids, strconv.FormatUint(route.ID, 10))
+	}
+	return modelGroupResponse{Key: strings.Join(ids, ":"), Routes: routes, EndpointCapabilities: append([]string(nil), value.EndpointCapabilities...)}
 }
 
 func parseIDs(values []string) ([]uint64, error) {

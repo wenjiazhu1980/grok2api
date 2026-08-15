@@ -13,9 +13,14 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	fhttptest "github.com/bogdanfinn/fhttp/httptest"
+	"github.com/bogdanfinn/websocket"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -24,36 +29,66 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
+	providerstreamidle "github.com/chenyme/grok2api/backend/internal/infra/provider/streamidle"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestCatalogMatchesSupportedSurface(t *testing.T) {
 	values := Catalog()
-	if len(values) != 8 {
+	requiredModels := []string{"grok-chat-fast", "grok-chat-auto", "grok-chat-expert", "grok-chat-heavy", "grok-imagine-image-lite", "grok-imagine-image-quality-lite", "grok-imagine-image-edit", "grok-imagine-video"}
+	if len(values) != len(requiredModels) {
 		t.Fatalf("catalog size = %d", len(values))
 	}
 	publicIDs := make(map[string]struct{}, len(values))
-	upstreamIDs := make(map[string]struct{}, len(values))
+	routeKeys := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if _, exists := publicIDs[value.PublicID]; exists {
-			t.Fatalf("duplicate public model: %s", value.PublicID)
+		routeKey := value.PublicID + "|" + string(value.Capability)
+		if _, exists := routeKeys[routeKey]; exists {
+			t.Fatalf("duplicate public model capability: %s", routeKey)
 		}
-		if _, exists := upstreamIDs[value.UpstreamModel]; exists {
-			t.Fatalf("duplicate route upstream model: %s", value.UpstreamModel)
-		}
+		routeKeys[routeKey] = struct{}{}
 		publicIDs[value.PublicID] = struct{}{}
-		upstreamIDs[value.UpstreamModel] = struct{}{}
 	}
-	for _, required := range []string{"grok-chat-fast", "grok-chat-auto", "grok-chat-expert", "grok-chat-heavy", "grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-edit", "grok-imagine-video"} {
+	for _, required := range requiredModels {
 		if _, exists := publicIDs[required]; !exists {
 			t.Fatalf("missing supported model: %s", required)
 		}
 	}
-	for _, removed := range []string{"grok-imagine-image-lite", "grok-imagine-image-speed", "grok-imagine-image-pro"} {
+	for _, required := range []string{
+		"grok-imagine-image-lite|image",
+		"grok-imagine-image-quality-lite|image",
+		"grok-imagine-image-edit|image_edit",
+	} {
+		if _, exists := routeKeys[required]; !exists {
+			t.Fatalf("missing supported route: %s", required)
+		}
+	}
+	for _, removed := range []string{"grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-2.0", "grok-imagine-image-quality-2.0", "grok-imagine-image-speed", "grok-imagine-image-pro"} {
 		if _, exists := publicIDs[removed]; exists {
 			t.Fatalf("obsolete image model remains: %s", removed)
 		}
+	}
+}
+
+func TestWebImagePublicNamesPreserveGatewayModels(t *testing.T) {
+	tests := map[string]string{
+		"grok-imagine-image":         "grok-imagine-image-lite",
+		"grok-imagine-image-quality": "grok-imagine-image-quality-lite",
+	}
+	for upstreamModel, publicID := range tests {
+		spec, ok := Resolve(upstreamModel)
+		if !ok {
+			t.Fatalf("missing upstream model %s", upstreamModel)
+		}
+		if spec.PublicID != publicID || spec.UpstreamModel != upstreamModel || spec.Capability != modeldomain.CapabilityImage {
+			t.Fatalf("resolved %s as %#v", upstreamModel, spec)
+		}
+	}
+	spec, ok := Resolve("imagine-image-edit")
+	if !ok || spec.PublicID != "grok-imagine-image-edit" || spec.Capability != modeldomain.CapabilityImageEdit {
+		t.Fatalf("edit upstream resolved as %#v ok=%v", spec, ok)
 	}
 }
 
@@ -93,31 +128,6 @@ func TestWebChatPricingUsesGrok45(t *testing.T) {
 	}
 }
 
-func TestBuildWebChatPayloadMatchesCurrentConversationProtocol(t *testing.T) {
-	payload := buildWebChatPayload("你好", "auto", []string{"file_1"})
-	if payload["modeId"] != "auto" || payload["temporary"] != true || payload["disableMemory"] != true {
-		t.Fatalf("payload protocol fields = %#v", payload)
-	}
-	attachments, ok := payload["fileAttachments"].([]string)
-	if !ok || !slices.Equal(attachments, []string{"file_1"}) {
-		t.Fatalf("fileAttachments = %#v", payload["fileAttachments"])
-	}
-	if _, ok := payload["disabledConnectorIds"]; !ok {
-		t.Fatal("payload missing disabledConnectorIds")
-	}
-	device, ok := payload["deviceEnvInfo"].(map[string]any)
-	if !ok || device["screenWidth"] != 2056 || device["screenHeight"] != 1328 || device["viewportWidth"] != 2056 || device["viewportHeight"] != 1083 {
-		t.Fatalf("deviceEnvInfo = %#v", payload["deviceEnvInfo"])
-	}
-	for _, obsolete := range []string{"connectors", "searchAllConnectors", "toolOverrides"} {
-		if _, ok := payload[obsolete]; ok {
-			t.Fatalf("payload contains obsolete field %q", obsolete)
-		}
-	}
-	encoded := string(MarshalJSONBytes(payload))
-	assertForbiddenFieldsAbsent(t, encoded)
-}
-
 func TestNormalizeOpenAIInputSeparatesTextAndImages(t *testing.T) {
 	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 	content, _ := json.Marshal([]any{
@@ -130,6 +140,122 @@ func TestNormalizeOpenAIInputSeparatesTextAndImages(t *testing.T) {
 	}
 	if value.Prompt != "[user]\n描述这张图" || !slices.Equal(value.Attachments, []chatAttachmentInput{{Source: dataURI, Image: true}}) {
 		t.Fatalf("normalized input = %#v", value)
+	}
+}
+
+func TestNormalizeLatestImageInputIgnoresHistoricalAssistantImage(t *testing.T) {
+	historical, _ := json.Marshal([]any{
+		map[string]any{"type": "text", "text": "first result"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/first.png"}},
+	})
+	latest, _ := json.Marshal("生成另一张蓝色的图片")
+	value, err := normalizeLatestImageInput(openAIRequest{Messages: []chatMessage{
+		{Role: "user", Content: json.RawMessage(`"生成第一张图片"`)},
+		{Role: "assistant", Content: historical},
+		{Role: "user", Content: latest},
+	}}, conversation.OperationChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Prompt != "生成另一张蓝色的图片" || len(value.Attachments) != 0 {
+		t.Fatalf("normalized latest image input = %#v", value)
+	}
+}
+
+func TestNormalizeLatestResponsesImageInputIgnoresHistory(t *testing.T) {
+	input, _ := json.Marshal([]any{
+		map[string]any{"type": "message", "role": "assistant", "content": []any{
+			map[string]any{"type": "output_text", "text": "![image](https://example.com/first.png)"},
+			map[string]any{"type": "input_image", "image_url": "https://example.com/first.png"},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "input_text", "text": "generate a different image"},
+		}},
+	})
+	value, err := normalizeLatestImageInput(openAIRequest{Input: input}, conversation.OperationResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Prompt != "generate a different image" || len(value.Attachments) != 0 {
+		t.Fatalf("normalized latest responses input = %#v", value)
+	}
+}
+
+func TestImageChatRejectsOnlyCurrentTurnAttachment(t *testing.T) {
+	content, _ := json.Marshal([]any{
+		map[string]any{"type": "text", "text": "make it blue"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/input.png"}},
+	})
+	response, err := (&Adapter{}).ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Method: http.MethodPost, Model: "grok-imagine-image", Operation: conversation.OperationChat,
+		Body: []byte(fmt.Sprintf(`{"model":"grok-imagine-image-lite","messages":[{"role":"user","content":%s}]}`, content)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "/v1/images/edits") {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestQualityImageResponsesUsesImageCompatibilityValidation(t *testing.T) {
+	response, err := (&Adapter{}).ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Method: http.MethodPost, Model: "grok-imagine-image-quality", Operation: conversation.OperationResponses,
+		Body: []byte(`{"model":"grok-imagine-image-quality-lite","input":[{"role":"user","content":[{"type":"input_text","text":"draw"}]}],"image_config":{"n":0}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "image_config.n") || strings.Contains(string(body), "模型不支持文本对话") {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestImageCompatibilityResponsesStreamUsesOutputStateMachine(t *testing.T) {
+	parsed := parsedChat{ResponseID: "resp_image", InputTokens: 3}
+	parsed.appendText("![image](https://example.com/generated.png)")
+	body, err := buildImageCompatibilityStream(
+		conversation.OperationResponses,
+		parsed.ResponseID,
+		"grok-imagine-image-lite",
+		&parsed,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := string(body)
+	for _, event := range []string{
+		"response.created",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.completed",
+	} {
+		if !strings.Contains(stream, "event: "+event+"\n") {
+			t.Fatalf("stream missing %s: %s", event, stream)
+		}
+	}
+	if strings.Contains(stream, "chat.completion.chunk") || strings.Contains(stream, "data: [DONE]") {
+		t.Fatalf("Responses stream contains Chat Completions envelope: %s", stream)
+	}
+	if len(parsed.ResponseOutput) != 1 {
+		t.Fatalf("response output = %#v", parsed.ResponseOutput)
+	}
+	item := parsed.ResponseOutput[0].(map[string]any)
+	if item["type"] != "message" || item["status"] != "completed" {
+		t.Fatalf("response output item = %#v", item)
+	}
+	itemID, _ := item["id"].(string)
+	completedAt := strings.Index(stream, "event: response.completed\n")
+	if itemID == "" || completedAt < 0 || !strings.Contains(stream[completedAt:], `"id":"`+itemID+`"`) {
+		t.Fatalf("completed response does not reuse output item %q: %s", itemID, stream)
 	}
 }
 
@@ -231,7 +357,7 @@ func TestRemoteChatImageHeadersNeverLeakCredentials(t *testing.T) {
 func TestChatImageUploadFeedsFileMetadataIntoConversation(t *testing.T) {
 	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 	var uploadUserAgent string
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
 		switch request.URL.Path {
 		case "/http/upload-file-v2/direct":
 			uploadUserAgent = request.Header.Get("User-Agent")
@@ -259,25 +385,44 @@ func TestChatImageUploadFeedsFileMetadataIntoConversation(t *testing.T) {
 		case "/rest/app-chat/upload-file":
 			t.Error("不应调用旧版 Base64 上传接口")
 			writer.WriteHeader(http.StatusInternalServerError)
-		case "/rest/app-chat/conversations/new":
+		case "/ws/mgw/":
 			if request.Header.Get("User-Agent") != uploadUserAgent {
 				t.Errorf("chat user-agent %q differs from upload %q", request.Header.Get("User-Agent"), uploadUserAgent)
 			}
-			var payload map[string]any
-			if json.NewDecoder(request.Body).Decode(&payload) != nil {
-				t.Error("chat payload is invalid JSON")
+			connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+			if err != nil {
+				t.Errorf("upgrade: %v", err)
+				return
 			}
-			attachments, _ := payload["fileAttachments"].([]any)
+			defer connection.Close()
+			var initial map[string]any
+			if err := connection.ReadJSON(&initial); err != nil {
+				t.Errorf("read session.create: %v", err)
+				return
+			}
+			initialEvent := initial["event"].(map[string]any)
+			initialID := initialEvent["event_id"].(string)
+			_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "session.created", "client_event_id": initialID}})
+			_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "conversation.attached", "conversation": map[string]any{"id": "conv_1"}}})
+			var item map[string]any
+			if err := connection.ReadJSON(&item); err != nil {
+				t.Errorf("read conversation.item.create: %v", err)
+				return
+			}
+			itemEvent := item["event"].(map[string]any)
+			attachments, _ := itemEvent["file_attachment_ids"].([]any)
 			if len(attachments) != 1 || attachments[0] != "file_meta_1" {
-				t.Errorf("fileAttachments = %#v", payload["fileAttachments"])
+				t.Errorf("file_attachment_ids = %#v", itemEvent["file_attachment_ids"])
 			}
-			writer.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(writer, "data: {\"result\":{\"conversation\":{\"conversationId\":\"conv_1\"}}}\n")
-			_, _ = io.WriteString(writer, "data: {\"result\":{\"response\":{\"userResponse\":{\"responseId\":\"parent_1\"}}}}\n")
-			_, _ = io.WriteString(writer, "data: {\"result\":{\"response\":{\"token\":\"seen\",\"isThinking\":false,\"messageTag\":\"final\"}}}\n")
-			_, _ = io.WriteString(writer, "data: [DONE]\n")
+			var create map[string]any
+			if err := connection.ReadJSON(&create); err != nil || create["event"].(map[string]any)["type"] != "response.create" {
+				t.Errorf("read response.create: value=%#v err=%v", create, err)
+				return
+			}
+			_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.chunk", "chunk": map[string]any{"text": map[string]any{"text": "seen", "channel": "CHANNEL_ASSISTANT_RESPONSE"}}}})
+			_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.done", "response": map[string]any{"id": "parent_1", "status": "completed"}}})
 		default:
-			http.NotFound(writer, request)
+			fhttp.NotFound(writer, request)
 		}
 	}))
 	defer server.Close()
@@ -299,7 +444,7 @@ func TestChatImageUploadFeedsFileMetadataIntoConversation(t *testing.T) {
 		"model": "grok-chat-fast", "messages": []any{map[string]any{"role": "user", "content": json.RawMessage(content)}},
 	})
 	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
-		Credential: account.Credential{ID: 1, EncryptedAccessToken: encrypted}, Method: http.MethodPost,
+		Credential: account.Credential{ID: 1, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted}, Method: http.MethodPost,
 		Path: "/responses", Body: body, Model: "grok-chat-fast", Operation: "chat",
 	})
 	if err != nil {
@@ -320,23 +465,41 @@ func TestForwardMessagesWebSearchEndToEnd(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			var upstreamMessage string
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				if request.URL.Path != "/rest/app-chat/conversations/new" {
-					http.NotFound(writer, request)
+			server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+				if request.URL.Path != "/ws/mgw/" {
+					fhttp.NotFound(writer, request)
 					return
 				}
-				var payload map[string]any
-				if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-					t.Errorf("upstream payload: %v", err)
-					writer.WriteHeader(http.StatusBadRequest)
+				connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+				if err != nil {
+					t.Errorf("upgrade: %v", err)
 					return
 				}
-				upstreamMessage, _ = payload["message"].(string)
-				writer.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(writer, "data: {\"result\":{\"conversation\":{\"conversationId\":\"conv_1\"}}}\n")
-				_, _ = io.WriteString(writer, "data: {\"result\":{\"response\":{\"rolloutId\":\"search_1\",\"messageStepId\":1,\"messageTag\":\"tool_usage_card\"}}}\n")
-				_, _ = io.WriteString(writer, "data: {\"result\":{\"response\":{\"token\":\"Here you go.\",\"isThinking\":false,\"messageTag\":\"final\",\"webSearchResults\":{\"results\":[{\"url\":\"https://doc.rust-lang.org\",\"title\":\"The Rust Book\"}]}}}}\n")
-				_, _ = io.WriteString(writer, "data: [DONE]\n")
+				defer connection.Close()
+				var initial map[string]any
+				if err := connection.ReadJSON(&initial); err != nil {
+					t.Errorf("read session.create: %v", err)
+					return
+				}
+				initialID := initial["event"].(map[string]any)["event_id"].(string)
+				_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "session.created", "client_event_id": initialID}})
+				_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "conversation.attached", "conversation": map[string]any{"id": "conv_1"}}})
+				var item map[string]any
+				if err := connection.ReadJSON(&item); err != nil {
+					t.Errorf("read conversation.item.create: %v", err)
+					return
+				}
+				itemValue := item["event"].(map[string]any)["item"].(map[string]any)
+				chunks := itemValue["x_grok"].(map[string]any)["input_chunks"].([]any)
+				upstreamMessage, _ = chunks[len(chunks)-1].(map[string]any)["text"].(map[string]any)["text"].(string)
+				var create map[string]any
+				if err := connection.ReadJSON(&create); err != nil {
+					t.Errorf("read response.create: %v", err)
+					return
+				}
+				_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.search.result", "result": map[string]any{"url": "https://doc.rust-lang.org", "title": "The Rust Book"}}})
+				_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.chunk", "chunk": map[string]any{"text": map[string]any{"text": "Here you go.", "channel": "CHANNEL_ASSISTANT_RESPONSE"}}}})
+				_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.done", "response": map[string]any{"id": "parent_1", "status": "completed"}}})
 			}))
 			defer server.Close()
 
@@ -356,7 +519,7 @@ func TestForwardMessagesWebSearchEndToEnd(t *testing.T) {
 				"tool_choice": map[string]any{"type": "tool", "name": "web_search"},
 			})
 			response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
-				Credential: account.Credential{ID: 1, EncryptedAccessToken: encrypted}, Method: http.MethodPost,
+				Credential: account.Credential{ID: 1, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted}, Method: http.MethodPost,
 				Path: "/responses", Body: body, Model: "grok-chat-fast", Operation: conversation.OperationMessages,
 				Streaming: streaming,
 			})
@@ -410,6 +573,97 @@ func TestForwardMessagesWebSearchEndToEnd(t *testing.T) {
 	}
 }
 
+func TestOpenChatScopesStreamIdleTimeoutToTextStreams(t *testing.T) {
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		if request.URL.Path != "/ws/mgw/" {
+			fhttp.NotFound(writer, request)
+			return
+		}
+		connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			if _, _, err := connection.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{
+		BaseURL: server.URL, StatsigMode: "manual", ChatTimeoutSeconds: 5, StreamIdleTimeoutSeconds: 1,
+	}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	credential := account.Credential{ID: 1, Provider: account.ProviderWeb, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted}
+	spec, ok := Resolve("grok-chat-fast")
+	if !ok {
+		t.Fatal("grok-chat-fast spec not found")
+	}
+
+	for _, enforceStreamIdle := range []bool{false, true} {
+		upstream, lease, _, _, openErr := adapter.openChat(context.Background(), credential, "", spec, normalizedChatInput{Prompt: "hello"}, enforceStreamIdle)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		_, wrapped := upstream.Body.(*providerstreamidle.ReadCloser)
+		if wrapped != enforceStreamIdle {
+			t.Fatalf("stream-idle wrapper present = %t, enforce = %t", wrapped, enforceStreamIdle)
+		}
+		_ = upstream.Body.Close()
+		lease.Release()
+	}
+}
+
+func TestWebNonStreamingResponseStillProtectsGatewayStream(t *testing.T) {
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		if request.URL.Path != "/ws/mgw/" {
+			fhttp.NotFound(writer, request)
+			return
+		}
+		connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			if _, _, err := connection.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{
+		BaseURL: server.URL, StatsigMode: "manual", ChatTimeoutSeconds: 5, StreamIdleTimeoutSeconds: 1,
+	}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	body := []byte(`{"model":"grok-chat-fast","input":"hello","stream":false}`)
+	_, err = adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/responses", Model: "grok-chat-fast", Operation: conversation.OperationResponses,
+		Body: body, Streaming: false,
+	})
+	if !errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout) {
+		t.Fatalf("ForwardResponse() error = %v, want ErrUpstreamStreamIdleTimeout", err)
+	}
+}
+
 type egressRepositoryStub struct{}
 
 func (egressRepositoryStub) ListEgressNodes(context.Context, egressdomain.Scope, repository.SortQuery) ([]egressdomain.Node, error) {
@@ -444,6 +698,56 @@ func TestLiteChatRejectsInvalidImageConfigBeforeUpstream(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
+func TestLiteChatStreamFailsBeforeReturningSuccessResponse(t *testing.T) {
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		if request.URL.Path != "/ws/mgw/" {
+			fhttp.NotFound(writer, request)
+			return
+		}
+		connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer connection.Close()
+		var initial map[string]any
+		if err := connection.ReadJSON(&initial); err != nil {
+			t.Errorf("read session.create: %v", err)
+			return
+		}
+		initialID := initial["event"].(map[string]any)["event_id"].(string)
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "session.created", "client_event_id": initialID}})
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "conversation.attached", "conversation": map[string]any{"id": "conv_1"}}})
+		for range 2 {
+			var event map[string]any
+			if err := connection.ReadJSON(&event); err != nil {
+				t.Errorf("read turn event: %v", err)
+				return
+			}
+		}
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.done", "response": map[string]any{"id": "parent_1", "status": "completed"}}})
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual"}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, imageAssetStoreStub{})
+	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/v1/chat/completions", Model: "grok-imagine-image", Operation: conversation.OperationChat,
+		Body: []byte(`{"model":"grok-imagine-image-lite","stream":true,"messages":[{"role":"user","content":"draw a cat"}]}`), Streaming: true,
+	})
+	if err == nil || response != nil || !strings.Contains(err.Error(), "未解析到最终图片") {
+		t.Fatalf("response=%#v error=%v", response, err)
 	}
 }
 
@@ -741,7 +1045,10 @@ func TestBuildDirectFileUploadBodySanitizesUnsafeFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if part.FormName() != "file" || part.FileName() != "a\\b\"c_.png" {
+	// multipart 的 Part.FileName() 内部会过一层 filepath.Base(平台相关):
+	// Windows 把 \ 视作路径分隔符,会剥掉 a\ 前缀;Linux 则原样返回。
+	// 期望值同样用 filepath.Base 计算,双平台同时成立,断言强度不变。
+	if part.FormName() != "file" || part.FileName() != filepath.Base(`a\b"c_.png`) {
 		t.Fatalf("form name=%q filename=%q", part.FormName(), part.FileName())
 	}
 }
@@ -828,8 +1135,15 @@ func TestDecodeDirectFileUploadResponse(t *testing.T) {
 	if err != nil || uploaded.ID != "metadata-1" || uploaded.URI != "https://assets.grok.com/users/test/reference/content" {
 		t.Fatalf("uploaded=%#v err=%v", uploaded, err)
 	}
-	if _, err := decodeDirectFileUploadResponse(strings.NewReader(`{"uploadId":"upload-1","fileMetadata":{}}`)); err == nil {
-		t.Fatal("incomplete V2 upload response was accepted")
+	uploaded, err = decodeDirectFileUploadResponse(strings.NewReader(`{"uploadId":"upload-1","terminalError":{}}`))
+	if err != nil || uploaded.ID != "upload-1" || uploaded.URI != "" {
+		t.Fatalf("uploadId-only response: uploaded=%#v err=%v", uploaded, err)
+	}
+	if _, err := decodeDirectFileUploadResponse(strings.NewReader(`{"uploadId":"upload-1","terminalError":{"message":"rejected"}}`)); err == nil {
+		t.Fatal("terminal upload error was accepted")
+	}
+	if _, err := decodeDirectFileUploadResponse(strings.NewReader(`{"fileMetadata":{}}`)); err == nil {
+		t.Fatal("response without any file identifier was accepted")
 	}
 }
 
@@ -878,7 +1192,7 @@ func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing
 	}
 }
 
-func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
+func TestModelsUseLowestSufficientTierFirst(t *testing.T) {
 	adapter := &Adapter{}
 	tests := []struct {
 		model string
@@ -888,6 +1202,10 @@ func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
 		{model: "grok-chat-auto", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
 		{model: "grok-chat-expert", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
 		{model: "grok-chat-heavy", want: []account.WebTier{account.WebTierHeavy}},
+		{model: "grok-imagine-image", want: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}},
+		{model: "grok-imagine-image-quality", want: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}},
+		{model: "imagine-image-edit", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
+		{model: "grok-imagine-video", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
 	}
 	for _, test := range tests {
 		got := adapter.TierOrder(test.model)
@@ -911,8 +1229,23 @@ func TestOnlyChatModelsExposeRateLimitModes(t *testing.T) {
 			}
 			continue
 		}
+		if isImagineQuotaMode(spec.Mode) {
+			continue
+		}
 		if spec.Mode != "" {
 			t.Fatalf("media model %s must not expose chat quota mode %q", spec.PublicID, spec.Mode)
+		}
+	}
+}
+
+func TestQuotaRefreshGroupSeparatesImagineEndpointFromLiteChatQuota(t *testing.T) {
+	adapter := &Adapter{}
+	if got := adapter.QuotaRefreshGroup("grok-imagine-image"); got != "" {
+		t.Fatalf("lite refresh group = %q", got)
+	}
+	for _, model := range []string{"grok-imagine-image-quality", "imagine-image-edit", "grok-imagine-video"} {
+		if got := adapter.QuotaRefreshGroup(model); got != account.QuotaGroupWebImagine {
+			t.Fatalf("QuotaRefreshGroup(%q) = %q", model, got)
 		}
 	}
 }
@@ -1266,6 +1599,58 @@ func TestParseVideoStreamPreservesUpstreamStatus(t *testing.T) {
 	status, ok := provider.ErrorHTTPStatus(err)
 	if !ok || status != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, ok = %v, err = %v", status, ok, err)
+	}
+}
+
+func TestGenerateVideoClassifiesOnlyExplicitHTTPRejectionAsCreateFailure(t *testing.T) {
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/rest/media/post/create":
+			_, _ = io.WriteString(writer, `{"post":{"id":"post_1"}}`)
+		case "/rest/app-chat/conversations/new":
+			writer.WriteHeader(status)
+			if status == http.StatusOK {
+				_, _ = io.WriteString(writer, `{}`)
+			} else {
+				_, _ = io.WriteString(writer, `{"error":"rate limited"}`)
+			}
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedToken, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := infraegress.NewManager(egressRepositoryStub{}, cipher)
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test"}, manager, cipher, nil, nil)
+	request := provider.VideoRequest{
+		Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
+		Prompt:     "test",
+		Duration:   5,
+	}
+
+	_, err = adapter.GenerateVideo(context.Background(), request)
+	if stage, ok := provider.VideoErrorStage(err); !ok || stage != provider.VideoStagePoll {
+		t.Fatalf("successful response without a completed video stage = %q, ok=%t, err=%v", stage, ok, err)
+	}
+	status = http.StatusTooManyRequests
+	_, err = adapter.GenerateVideo(context.Background(), request)
+	if stage, ok := provider.VideoErrorStage(err); !ok || stage != provider.VideoStageCreate {
+		t.Fatalf("explicit HTTP rejection stage = %q, ok=%t, err=%v", stage, ok, err)
+	}
+	status = http.StatusInternalServerError
+	_, err = adapter.GenerateVideo(context.Background(), request)
+	if stage, ok := provider.VideoErrorStage(err); !ok || stage != provider.VideoStageSubmitted {
+		t.Fatalf("server failure stage = %q, ok=%t, err=%v", stage, ok, err)
 	}
 }
 

@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 )
 
 func TestNormalizeResponsesRequest(t *testing.T) {
@@ -41,19 +43,29 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 func TestNormalizeBuildReasoningEffort(t *testing.T) {
 	tests := []struct {
 		name   string
+		model  string
 		effort string
 		want   string
 	}{
-		{name: "max", effort: "max", want: "high"},
-		{name: "xhigh", effort: "xhigh", want: "high"},
-		{name: "uppercase max", effort: "MAX", want: "high"},
-		{name: "high", effort: "high", want: "high"},
-		{name: "medium", effort: "medium", want: "medium"},
+		{name: "4.5 max", model: "grok-4.5", effort: "max", want: "high"},
+		{name: "4.5 xhigh", model: "grok-4.5", effort: "xhigh", want: "high"},
+		{name: "4.5 uppercase max", model: "grok-4.5", effort: "MAX", want: "high"},
+		{name: "multi-agent xhigh", model: "grok-4.20-multi-agent-0309", effort: "xhigh", want: "xhigh"},
+		{name: "multi-agent uppercase xhigh", model: "grok-4.20-multi-agent-0309", effort: "XHIGH", want: "xhigh"},
+		{name: "multi-agent max maps to highest supported effort", model: "grok-4.20-multi-agent-0309", effort: "max", want: "xhigh"},
+		{name: "4.6 xhigh", model: "grok-4.6", effort: "xhigh", want: "xhigh"},
+		{name: "4.6 uppercase xhigh", model: "grok-4.6", effort: "XHIGH", want: "xhigh"},
+		{name: "4.6 max maps to xhigh", model: "grok-4.6", effort: "max", want: "xhigh"},
+		{name: "prefixed 4.6 uppercase max maps to xhigh", model: "Build/grok-4.6", effort: "MAX", want: "xhigh"},
+		{name: "unknown xhigh remains guarded", model: "future-model", effort: "xhigh", want: "high"},
+		{name: "unknown max remains guarded", model: "future-model", effort: "max", want: "high"},
+		{name: "high", model: "grok-4.5", effort: "high", want: "high"},
+		{name: "medium", model: "grok-4.5", effort: "medium", want: "medium"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			body := []byte(`{"reasoning":{"effort":"` + test.effort + `"},"input":"hello"}`)
-			normalized, err := normalizeBuildReasoningEffort(body)
+			normalized, err := normalizeBuildRequest(body, test.model)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -66,6 +78,168 @@ func TestNormalizeBuildReasoningEffort(t *testing.T) {
 				t.Fatalf("reasoning = %#v, want %q", payload["reasoning"], test.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeBuildMaxAcrossCompatibilityProtocols(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "responses", body: []byte(`{"reasoning":{"effort":"max"},"input":"hello"}`)},
+		{name: "chat completions", body: func() []byte {
+			converted, _, err := conversation.ConvertRequestWithOptions(
+				[]byte(`{"model":"public","messages":[{"role":"user","content":"hello"}],"reasoning_effort":"max"}`),
+				"grok-4.6",
+				conversation.OperationChat,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return converted
+		}()},
+		{name: "anthropic messages", body: func() []byte {
+			converted, _, err := conversation.ConvertRequestWithOptions(
+				[]byte(`{"model":"public","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+				"grok-4.6",
+				conversation.OperationMessages,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return converted
+		}()},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, err := normalizeBuildRequest(test.body, "grok-4.6")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(normalized, &payload); err != nil {
+				t.Fatal(err)
+			}
+			reasoning, ok := payload["reasoning"].(map[string]any)
+			if !ok || reasoning["effort"] != "xhigh" {
+				t.Fatalf("reasoning = %#v, want max normalized to xhigh", payload["reasoning"])
+			}
+		})
+	}
+}
+
+func TestNormalizeBuildComposerStripsReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "responses", body: []byte(`{"reasoning":{"effort":"high","summary":"auto"},"input":"hello"}`)},
+		{name: "chat conversion", body: func() []byte {
+			converted, _, err := conversation.ConvertRequestWithOptions(
+				[]byte(`{"model":"public","messages":[{"role":"user","content":"hello"}],"reasoning_effort":"high"}`),
+				modeldomain.GrokComposer25Fast,
+				conversation.OperationChat,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return converted
+		}()},
+		{name: "messages conversion", body: func() []byte {
+			converted, _, err := conversation.ConvertRequestWithOptions(
+				[]byte(`{"model":"public","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}}`),
+				modeldomain.GrokComposer25Fast,
+				conversation.OperationMessages,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return converted
+		}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, err := normalizeBuildRequest(test.body, modeldomain.GrokComposer25Fast)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if json.Unmarshal(normalized, &payload) != nil {
+				t.Fatalf("invalid normalized payload: %s", normalized)
+			}
+			if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+				if _, exists := reasoning["effort"]; exists {
+					t.Fatalf("Composer reasoning effort leaked upstream: %#v", payload)
+				}
+			}
+		})
+	}
+
+	stripped, err := normalizeBuildRequest([]byte(`{"reasoning":{"effort":"medium"},"input":"hello"}`), modeldomain.GrokComposer25Fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if json.Unmarshal(stripped, &payload) != nil || payload["reasoning"] != nil {
+		t.Fatalf("empty Composer reasoning object was not removed: %s", stripped)
+	}
+}
+
+func TestNormalizeBuildRequestAppliesSafeDefaultsAndStripsCodexEnvelope(t *testing.T) {
+	body := []byte(`{
+		"model":"public",
+		"input":"hello",
+		"metadata":{"tenant":"keep"},
+		"client_metadata":{"cwd":"/private/workspace","git_remote":"ssh://private/repo"},
+		"include":["web_search_call.action.sources"]
+	}`)
+	normalized, err := normalizeBuildRequest(body, "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["client_metadata"] != nil {
+		t.Fatalf("client_metadata crossed Build boundary: %#v", payload["client_metadata"])
+	}
+	if payload["metadata"].(map[string]any)["tenant"] != "keep" || payload["store"] != false {
+		t.Fatalf("standard metadata or store default changed incorrectly: %#v", payload)
+	}
+	includes := payload["include"].([]any)
+	if len(includes) != 2 || includes[0] != "web_search_call.action.sources" || includes[1] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v", includes)
+	}
+}
+
+func TestNormalizeBuildRequestPreservesExplicitStoreAndEncryptedInclude(t *testing.T) {
+	body := []byte(`{"input":"hello","store":true,"include":["reasoning.encrypted_content"],"stream_tool_calls":true}`)
+	normalized, err := normalizeBuildRequest(body, "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["store"] != true || len(payload["include"].([]any)) != 1 || payload["stream_tool_calls"] != true {
+		t.Fatalf("explicit Build defaults were overwritten: %#v", payload)
+	}
+}
+
+func TestNormalizeBuildRequestDoesNotInventStreamToolCalls(t *testing.T) {
+	normalized, err := normalizeBuildRequest([]byte(`{"input":"hello"}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["stream_tool_calls"]; exists {
+		t.Fatalf("stream_tool_calls must remain client/model controlled: %#v", payload)
 	}
 }
 
@@ -156,6 +330,30 @@ func TestParseImportedCredentialsJSONSequence(t *testing.T) {
 	}
 	if len(values) != 2 || values[0].AccessToken != "access-1" || values[0].UserID != "user-1" || values[1].RefreshToken != "refresh-2" {
 		t.Fatalf("JSON sequence import = %#v", values)
+	}
+}
+
+// 批量注册工具导出的顶层裸数组形态。
+func TestParseImportedCredentialsBareArray(t *testing.T) {
+	data := []byte(`[{"type":"xai","access_token":"access-1","refresh_token":"refresh-1","email":"user@example.com","user_id":"user-1","expires_at":"2026-08-01T00:00:00Z"}` +
+		`,{"type":"xai","refresh_token":"refresh-2"}]`)
+	values, err := parseImportedCredentials(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].AccessToken != "access-1" || values[0].Email != "user@example.com" || values[0].UserID != "user-1" || values[0].ExpiresAt.IsZero() || values[1].RefreshToken != "refresh-2" {
+		t.Fatalf("bare array import = %#v", values)
+	}
+	if values[0].SourceKey == values[1].SourceKey {
+		t.Fatal("不同账号生成了相同来源标识")
+	}
+}
+
+// null 元素不在解码层拦截，归一化阶段须带账号序号报错。
+func TestParseImportedCredentialsBareArrayRejectsNullElement(t *testing.T) {
+	_, err := parseImportedCredentials([]byte(`[{"refresh_token":"refresh-1"},null]`))
+	if err == nil || !strings.Contains(err.Error(), "第 2 个账号") {
+		t.Fatalf("error = %v, want indexed normalize error", err)
 	}
 }
 

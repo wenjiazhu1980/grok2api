@@ -6,6 +6,15 @@ const (
 	DefaultBuildResponseHeaderTimeout = 5 * time.Minute
 	MinBuildResponseHeaderTimeout     = 30 * time.Second
 	MaxBuildResponseHeaderTimeout     = 30 * time.Minute
+
+	DefaultBuildStreamIdleTimeout = 2 * time.Minute
+	MinBuildStreamIdleTimeout     = 30 * time.Second
+	MaxBuildStreamIdleTimeout     = 10 * time.Minute
+
+	DefaultWebStreamIdleTimeout     = 90 * time.Second
+	DefaultConsoleStreamIdleTimeout = 2 * time.Minute
+	MinProviderStreamIdleTimeout    = 30 * time.Second
+	MaxProviderStreamIdleTimeout    = 10 * time.Minute
 )
 
 // Config 表示可跨重启持久化并支持热加载的网关运行参数。
@@ -34,8 +43,9 @@ type FrontendConfig struct {
 }
 
 type ProviderConsoleConfig struct {
-	BaseURL     string
-	ChatTimeout time.Duration
+	BaseURL           string
+	ChatTimeout       time.Duration
+	StreamIdleTimeout time.Duration
 }
 
 type MediaConfig struct {
@@ -56,6 +66,7 @@ type ProviderWebConfig struct {
 	ClearanceRefresh    time.Duration
 	QuotaTimeout        time.Duration
 	ChatTimeout         time.Duration
+	StreamIdleTimeout   time.Duration
 	ImageTimeout        time.Duration
 	VideoTimeout        time.Duration
 	MediaConcurrency    int
@@ -82,29 +93,32 @@ type ProviderBuildConfig struct {
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration
+	StreamIdleTimeout     time.Duration
 }
 
 // RoutingConfig 定义会话粘性、冷却和故障切换边界。
 type RoutingConfig struct {
-	StickyTTL         time.Duration
-	CooldownBase      time.Duration
-	CooldownMax       time.Duration
-	CapacityWait      time.Duration
-	MaxAttempts       int
-	PreferFreeBuild   bool
-	SegmentedSelector *SegmentedSelectorConfig
+	StickyTTL       time.Duration
+	CooldownBase    time.Duration
+	CooldownMax     time.Duration
+	CapacityWait    time.Duration
+	MaxAttempts      int
+	VideoMaxAttempts int
+	PreferFreeBuild  bool
+	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false 保留模型级冷却。
+	MarkBuildChatDeniedAsReauth bool
+	// AccountIsolatedConnections is optional so persisted payloads written by
+	// older releases do not silently override a value supplied by config.yaml.
+	AccountIsolatedConnections *bool
+	SegmentedSelector          *SegmentedSelectorConfig
 }
 
-// SegmentedSelectorConfig persists the bounded selector policy.
-// A nil value means the stored settings predate this policy and startup defaults must be preserved.
 type SegmentedSelectorConfig struct {
-	// ActiveEnabled retains the original persisted field name so existing disabled policies remain disabled.
 	ActiveEnabled bool
 	MinCandidates int
 	WindowSize    int
 }
 
-// AuditConfig 定义请求审计异步写入参数。
 type AuditConfig struct {
 	BufferSize    int
 	BatchSize     int
@@ -124,6 +138,9 @@ type AccountsConfig struct {
 	MarkBuildForbiddenReauth bool
 	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.
 	BuildForbiddenReauthCodes []string
+	// ExcludeBuildBotFlaggedFromScheduling 为 true 时，bot_flag_source/bfs∈{1,2} 的 Build 账号不参与调度。
+	// 仅影响 ProviderBuild 选号；关联 Web/Console 账号调度不受影响。
+	ExcludeBuildBotFlaggedFromScheduling bool
 	// AutoCleanReauthEnabled 为 true 时，周期性删除已标记 reauthRequired 且超过 minAge 的账号。
 	AutoCleanReauthEnabled bool
 	// AutoCleanReauthInterval 自动清理扫描间隔。

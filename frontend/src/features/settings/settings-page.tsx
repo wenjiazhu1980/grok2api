@@ -27,6 +27,7 @@ export function SettingsPage() {
   const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
   const [unlimitedAttemptsConfirm, setUnlimitedAttemptsConfirm] = useState(false);
   const limitedRoutingAttemptsRef = useRef(3);
+  const limitedVideoRoutingAttemptsRef = useRef(999);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
   const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
   const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
@@ -111,6 +112,7 @@ export function SettingsPage() {
               <SettingsField controlId="provider-token-auth" label={t("settings.provider.tokenAuth")} description={t("settings.provider.tokenAuthHelp")} error={form.formState.errors.providerBuild?.tokenAuth?.message}><Input id="provider-token-auth" autoComplete="off" {...form.register("providerBuild.tokenAuth")} /></SettingsField>
               <SettingsField controlId="provider-user-agent" label={t("settings.provider.userAgent")} description={t("settings.provider.userAgentHelp")} error={form.formState.errors.providerBuild?.userAgent?.message}><Input id="provider-user-agent" {...form.register("providerBuild.userAgent")} /></SettingsField>
               <SettingsField controlId="provider-response-header-timeout" label={t("settingsBuildTransport.responseHeaderTimeout")} description={t("settingsBuildTransport.responseHeaderTimeoutHelp")} error={form.formState.errors.providerBuild?.responseHeaderTimeout?.message}><Controller control={form.control} name="providerBuild.responseHeaderTimeout" render={({ field }) => <DurationInput id="provider-response-header-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="provider-stream-idle-timeout" label={t("settingsBuildTransport.streamIdleTimeout")} description={t("settingsBuildTransport.streamIdleTimeoutHelp")} error={form.formState.errors.providerBuild?.streamIdleTimeout?.message}><Controller control={form.control} name="providerBuild.streamIdleTimeout" render={({ field }) => <DurationInput id="provider-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
           </SettingsPane>
@@ -140,6 +142,7 @@ export function SettingsPage() {
               )}
               <SettingsField controlId="web-quota-timeout" label={t("settings.web.quotaTimeout")} description={t("settings.web.quotaTimeoutHelp")} error={form.formState.errors.providerWeb?.quotaTimeout?.message}><Controller control={form.control} name="providerWeb.quotaTimeout" render={({ field }) => <DurationInput id="web-quota-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-chat-timeout" label={t("settings.web.chatTimeout")} description={t("settings.web.chatTimeoutHelp")} error={form.formState.errors.providerWeb?.chatTimeout?.message}><Controller control={form.control} name="providerWeb.chatTimeout" render={({ field }) => <DurationInput id="web-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="web-stream-idle-timeout" label={t("settings.web.streamIdleTimeout")} description={t("settings.web.streamIdleTimeoutHelp")} error={form.formState.errors.providerWeb?.streamIdleTimeout?.message}><Controller control={form.control} name="providerWeb.streamIdleTimeout" render={({ field }) => <DurationInput id="web-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-image-timeout" label={t("settings.web.imageTimeout")} description={t("settings.web.imageTimeoutHelp")} error={form.formState.errors.providerWeb?.imageTimeout?.message}><Controller control={form.control} name="providerWeb.imageTimeout" render={({ field }) => <DurationInput id="web-image-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-video-timeout" label={t("settings.web.videoTimeout")} description={t("settings.web.videoTimeoutHelp")} error={form.formState.errors.providerWeb?.videoTimeout?.message}><Controller control={form.control} name="providerWeb.videoTimeout" render={({ field }) => <DurationInput id="web-video-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-media-concurrency" label={t("settings.web.mediaConcurrency")} description={t("settings.web.mediaConcurrencyHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.providerWeb?.mediaConcurrency?.message}><Input id="web-media-concurrency" type="number" min={1} max={64} {...form.register("providerWeb.mediaConcurrency", { valueAsNumber: true })} /></SettingsField>
@@ -155,6 +158,7 @@ export function SettingsPage() {
             <div className="space-y-0">
               <SettingsField controlId="console-base-url" className="sm:col-span-2" label={t("console.baseURL")} description={t("settings.console.baseURLHelp")} error={form.formState.errors.providerConsole?.baseURL?.message}><Input id="console-base-url" type="url" {...form.register("providerConsole.baseURL")} /></SettingsField>
               <SettingsField controlId="console-chat-timeout" label={t("console.chatTimeout")} description={t("settings.console.chatTimeoutHelp")} error={form.formState.errors.providerConsole?.chatTimeout?.message}><Controller control={form.control} name="providerConsole.chatTimeout" render={({ field }) => <DurationInput id="console-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="console-stream-idle-timeout" label={t("settings.console.streamIdleTimeout")} description={t("settings.console.streamIdleTimeoutHelp")} error={form.formState.errors.providerConsole?.streamIdleTimeout?.message}><Controller control={form.control} name="providerConsole.streamIdleTimeout" render={({ field }) => <DurationInput id="console-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
           </SettingsPane>
@@ -188,17 +192,18 @@ export function SettingsPage() {
               <SettingsField controlId="egress-clearance-mode" className="sm:col-span-2" label={t("settings.web.clearanceMode")} description={t("settings.web.clearanceModeHelp")} error={form.formState.errors.providerWeb?.clearanceMode?.message}>
                 <Controller control={form.control} name="providerWeb.clearanceMode" render={({ field }) => (
                   <Tabs value={field.value} onValueChange={field.onChange}>
-                    <TabsList id="egress-clearance-mode" className="grid w-full grid-cols-2 bg-muted/55">
+                    <TabsList id="egress-clearance-mode" className="grid w-full grid-cols-3 bg-muted/55">
                       <TabsTrigger value="manual" className="font-normal">{t("settings.web.clearanceManual")}</TabsTrigger>
                       <TabsTrigger value="flaresolverr" className="font-normal">{t("settings.web.clearanceFlareSolverr")}</TabsTrigger>
+                      <TabsTrigger value="on_demand" className="font-normal">{t("settings.web.clearanceOnDemand")}</TabsTrigger>
                     </TabsList>
                   </Tabs>
                 )} />
               </SettingsField>
-              {draftClearanceMode === "flaresolverr" ? <>
+              {draftClearanceMode !== "manual" ? <>
                 <SettingsField controlId="egress-flaresolverr-url" className="sm:col-span-2" label={t("settings.web.flareSolverrURL")} description={t("settings.web.flareSolverrURLHelp")} error={form.formState.errors.providerWeb?.flareSolverrURL?.message}><Input id="egress-flaresolverr-url" type="url" placeholder="http://flaresolverr:8191" {...form.register("providerWeb.flareSolverrURL")} /></SettingsField>
                 <SettingsField controlId="egress-clearance-timeout" label={t("settings.web.clearanceTimeout")} description={t("settings.web.clearanceTimeoutHelp")} error={form.formState.errors.providerWeb?.clearanceTimeout?.message}><Controller control={form.control} name="providerWeb.clearanceTimeout" render={({ field }) => <DurationInput id="egress-clearance-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-                <SettingsField controlId="egress-clearance-refresh" label={t("settings.web.clearanceRefresh")} description={t("settings.web.clearanceRefreshHelp")} error={form.formState.errors.providerWeb?.clearanceRefresh?.message}><Controller control={form.control} name="providerWeb.clearanceRefresh" render={({ field }) => <DurationInput id="egress-clearance-refresh" value={field.value} onChange={field.onChange} />} /></SettingsField>
+                {draftClearanceMode === "flaresolverr" ? <SettingsField controlId="egress-clearance-refresh" label={t("settings.web.clearanceRefresh")} description={t("settings.web.clearanceRefreshHelp")} error={form.formState.errors.providerWeb?.clearanceRefresh?.message}><Controller control={form.control} name="providerWeb.clearanceRefresh" render={({ field }) => <DurationInput id="egress-clearance-refresh" value={field.value} onChange={field.onChange} />} /></SettingsField> : null}
               </> : null}
             </div>
           </SettingsSection>
@@ -269,7 +274,47 @@ export function SettingsPage() {
                   );
                 }} />
               </SettingsField>
+              <SettingsField controlId="routing-video-max-attempts" label={t("settings.routing.videoMaxAttempts")} description={t("settings.routing.videoMaxAttemptsHelp")} error={form.formState.errors.routing?.videoMaxAttempts?.message}>
+                <Controller control={form.control} name="routing.videoMaxAttempts" render={({ field }) => {
+                  const unlimited = field.value === UNLIMITED_ROUTING_ATTEMPTS;
+                  return (
+                    <div className="flex h-9 items-center gap-3">
+                      <Input
+                        id="routing-video-max-attempts"
+                        ref={field.ref}
+                        name={field.name}
+                        type="number"
+                        min={1}
+                        max={MAX_ROUTING_ATTEMPTS}
+                        disabled={unlimited}
+                        value={unlimited || !Number.isFinite(field.value) || field.value <= 0 ? "" : field.value}
+                        placeholder={t("settingsRoutingAttempts.unlimited")}
+                        onBlur={field.onBlur}
+                        onChange={(event) => field.onChange(event.currentTarget.valueAsNumber)}
+                      />
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="text-xs text-muted-foreground">{t("settingsRoutingAttempts.unlimited")}</span>
+                        <Switch
+                          id="routing-video-max-attempts-unlimited"
+                          aria-label={t("settingsRoutingAttempts.unlimited")}
+                          checked={unlimited}
+                          onCheckedChange={(checked) => {
+                            if (checked) {
+                              if (field.value > 0) limitedVideoRoutingAttemptsRef.current = field.value;
+                              field.onChange(UNLIMITED_ROUTING_ATTEMPTS);
+                              return;
+                            }
+                            field.onChange(limitedVideoRoutingAttemptsRef.current);
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                }} />
+              </SettingsField>
               <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")} description={t("settings.routing.preferFreeBuildHelp")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-mark-build-chat-denied-as-reauth" label={t("settings.routing.markBuildChatDeniedAsReauth")} description={t("settings.routing.markBuildChatDeniedAsReauthHelp")}><Controller control={form.control} name="routing.markBuildChatDeniedAsReauth" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-mark-build-chat-denied-as-reauth" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-account-isolated-connections" label={t("settings.routing.accountIsolatedConnections")} description={t("settings.routing.accountIsolatedConnectionsHelp")}><Controller control={form.control} name="routing.accountIsolatedConnections" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-account-isolated-connections" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-segmented-selector-enabled" label={t("settingsRoutingSegmented.enabled")} description={t("settingsRoutingSegmented.enabledHelp")}><Controller control={form.control} name="routing.segmentedSelector.enabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-segmented-selector-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-segmented-min-candidates" label={t("settingsRoutingSegmented.minCandidates")} description={t("settingsRoutingSegmented.minCandidatesHelp")} error={form.formState.errors.routing?.segmentedSelector?.minCandidates?.message}><Input id="routing-segmented-min-candidates" type="number" min={100} max={1_000_000} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.minCandidates", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="routing-segmented-window-size" label={t("settingsRoutingSegmented.windowSize")} description={t("settingsRoutingSegmented.windowSizeHelp")} error={form.formState.errors.routing?.segmentedSelector?.windowSize?.message}><Input id="routing-segmented-window-size" type="number" min={8} max={256} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.windowSize", { valueAsNumber: true })} /></SettingsField>
@@ -336,6 +381,30 @@ export function SettingsPage() {
                     disabled={!buildForbiddenReauthEnabled}
                     placeholder={t("settingsBuildForbidden.codesPlaceholder")}
                     {...form.register("accounts.buildForbiddenReauthCodes")}
+                  />
+                </SettingsField>
+              </div>
+            </SettingsSection>
+
+            <SettingsSection title={t("settings.accounts.botRiskSchedulingTitle")}>
+              <div className="space-y-0">
+                <SettingsField
+                  controlId="accounts-exclude-build-bot-flagged"
+                  label={t("settings.accounts.excludeBuildBotFlaggedFromScheduling")}
+                  description={t("settings.accounts.excludeBuildBotFlaggedFromSchedulingHelp")}
+                >
+                  <Controller
+                    control={form.control}
+                    name="accounts.excludeBuildBotFlaggedFromScheduling"
+                    render={({ field }) => (
+                      <div className="flex h-9 items-center">
+                        <Switch
+                          id="accounts-exclude-build-bot-flagged"
+                          checked={Boolean(field.value)}
+                          onCheckedChange={field.onChange}
+                        />
+                      </div>
+                    )}
                   />
                 </SettingsField>
               </div>

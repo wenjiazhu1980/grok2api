@@ -32,14 +32,15 @@ export type AuditDTO = {
   modelPublicId?: string;
   modelUpstreamModel?: string;
   provider: "grok_build" | "grok_web" | "grok_console";
-  operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video";
+  operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "tts" | "stt" | "realtime" | "voice";
   usageSource: "upstream" | "estimated" | "none";
   accountId?: string;
   accountName?: string;
   egressNodeId?: string;
   egressNodeName?: string;
-  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset";
+  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset" | "grok_console_asset";
   egressMode?: "direct" | "proxy";
+  // 0 表示已返回 2xx 响应头但流随后失败（如首字节超时/流式中断），不属于任何 HTTP 状态段。
   statusCode: number;
   streaming: boolean;
   mediaInputImages: number;
@@ -140,10 +141,10 @@ const auditBillingValidator = hasShape({
 const auditValidator = hasShape({
   id: isString, requestId: isString, clientKeyId: isString, clientKeyName: isOptional(isString), modelRouteId: isString,
   modelPublicId: isOptional(isString), modelUpstreamModel: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
-  operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video"), usageSource: isOneOf("upstream", "estimated", "none"),
+  operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video", "tts", "stt", "realtime", "voice"), usageSource: isOneOf("upstream", "estimated", "none"),
   accountId: isOptional(isString), accountName: isOptional(isString),
   egressNodeId: isOptional(isString), egressNodeName: isOptional(isString),
-  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
+  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
   statusCode: isNumber, streaming: isBoolean,
   mediaInputImages: isNumber, mediaOutputImages: isNumber, mediaOutputSeconds: isNumber, inputTokens: isNumber,
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,

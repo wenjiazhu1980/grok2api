@@ -14,10 +14,7 @@ var ErrSubscriptionSync = errors.New("代理订阅同步失败")
 
 func (s *Service) syncSource(ctx context.Context, operations OperationsRepository, source domain.SubscriptionSource) (ImportResult, error) {
 	now := time.Now().UTC()
-	nextSyncAt := now.Add(time.Duration(source.RefreshIntervalSeconds) * time.Second)
-	if source.RefreshIntervalSeconds < 60 {
-		nextSyncAt = now.Add(defaultProbeIntervalSeconds * time.Second)
-	}
+	nextSyncAt := sourceNextSyncAt(source, now)
 	recordFailure := func() {
 		// The source URL and any transport detail are deliberately omitted from
 		// persisted status and API errors; they may contain subscription tokens.
@@ -32,7 +29,12 @@ func (s *Service) syncSource(ctx context.Context, operations OperationsRepositor
 		recordFailure()
 		return ImportResult{}, ErrSubscriptionSync
 	}
-	content, err := fetchProxySubscription(ctx, urlValue)
+	fetchProxy, err := s.subscriptionFetchProxy(source)
+	if err != nil {
+		recordFailure()
+		return ImportResult{}, ErrSubscriptionSync
+	}
+	content, err := fetchProxySubscription(ctx, urlValue, fetchProxy)
 	if err != nil {
 		recordFailure()
 		return ImportResult{}, ErrSubscriptionSync
@@ -71,4 +73,27 @@ func (s *Service) syncSource(ctx context.Context, operations OperationsRepositor
 		return ImportResult{}, err
 	}
 	return ImportResult{Imported: imported, Skipped: skipped}, nil
+}
+
+func sourceNextSyncAt(source domain.SubscriptionSource, now time.Time) time.Time {
+	if source.RefreshIntervalSeconds < 60 {
+		return now.Add(defaultProbeIntervalSeconds * time.Second)
+	}
+	return now.Add(time.Duration(source.RefreshIntervalSeconds) * time.Second)
+}
+
+func (s *Service) subscriptionFetchProxy(source domain.SubscriptionSource) (string, error) {
+	encrypted := strings.TrimSpace(source.EncryptedProxyURL)
+	if encrypted == "" {
+		return "", nil
+	}
+	decrypted, err := s.cipher.Decrypt(encrypted)
+	if err != nil {
+		return "", err
+	}
+	normalized, err := NormalizeProxyURL(decrypted)
+	if err != nil || normalized == "" || strings.Contains(normalized, ProxyAccountPlaceholder) {
+		return "", errors.New("订阅拉取代理配置无效")
+	}
+	return normalized, nil
 }

@@ -58,6 +58,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	input.Frontend.PublicAPIBaseURL = "https://public.example.com"
 	input.ProviderConsole.BaseURL = "https://console.example.com"
 	input.ProviderConsole.ChatTimeout = "6m"
+	input.ProviderWeb.ClearanceProvided = true
+	input.ProviderWeb.ClearanceMode = config.ClearanceModeOnDemand
+	input.ProviderWeb.FlareSolverrURL = "http://flaresolverr:8191"
 	input.Batch = BatchConfig{ImportConcurrency: 26, ConversionConcurrency: 27, SyncConcurrency: 28, RefreshConcurrency: 29, RandomDelay: "750ms"}
 
 	snapshot, err := service.Update(context.Background(), service.Get().Revision, input)
@@ -85,6 +88,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if applied.Provider.Console.BaseURL != "https://console.example.com" || applied.Provider.Console.ChatTimeout.Value() != 6*time.Minute {
 		t.Fatalf("console configuration was not applied: %#v", applied.Provider.Console)
 	}
+	if applied.Provider.Web.ClearanceMode != config.ClearanceModeOnDemand || applied.Provider.Web.FlareSolverrURL != "http://flaresolverr:8191" {
+		t.Fatalf("on-demand Clearance configuration was not applied: %#v", applied.Provider.Web)
+	}
 	if len(snapshot.RestartRequired) != 1 || snapshot.RestartRequired[0] != "audit.bufferSize" {
 		t.Fatalf("restartRequired = %#v", snapshot.RestartRequired)
 	}
@@ -92,7 +98,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" || reloaded.Provider.Web.ClearanceMode != config.ClearanceModeOnDemand {
 		t.Fatalf("configuration was not persisted")
 	}
 }
@@ -115,6 +121,43 @@ func TestUpdateRejectsBuildResponseHeaderTimeoutOutsideSafeRange(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsStreamIdleTimeoutBeyondChatTimeout(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*EditableConfig)
+	}{
+		{
+			name: "web",
+			mutate: func(input *EditableConfig) {
+				input.ProviderWeb.ChatTimeout = "1m"
+				input.ProviderWeb.StreamIdleTimeout = "2m"
+			},
+		},
+		{
+			name: "console",
+			mutate: func(input *EditableConfig) {
+				input.ProviderConsole.ChatTimeout = "1m"
+				input.ProviderConsole.StreamIdleTimeout = "2m"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			repository := &runtimeSettingsRepositoryStub{}
+			service := NewService(cfg, time.Time{}, 0, repository, nil, nil)
+			input := service.Get().Config
+			test.mutate(&input)
+			if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v, want ErrInvalidInput", err)
+			}
+			if repository.found {
+				t.Fatal("shadowed stream idle timeout was persisted")
+			}
+		})
+	}
+}
+
 func TestUpdateValidatesMaxAttemptsRange(t *testing.T) {
 	cfg := testConfig(t)
 	repository := &runtimeSettingsRepositoryStub{}
@@ -122,12 +165,12 @@ func TestUpdateValidatesMaxAttemptsRange(t *testing.T) {
 	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
 
 	input := service.Get().Config
-	input.Routing.MaxAttempts = 200
+	input.Routing.MaxAttempts = 65535
 	snapshot, err := service.Update(context.Background(), 0, input)
 	if err != nil {
 		t.Fatalf("maximum maxAttempts was rejected: %v", err)
 	}
-	if applied.Routing.MaxAttempts != 200 || snapshot.Config.Routing.MaxAttempts != 200 {
+	if applied.Routing.MaxAttempts != 65535 || snapshot.Config.Routing.MaxAttempts != 65535 {
 		t.Fatalf("maximum maxAttempts was not applied: applied=%d snapshot=%d", applied.Routing.MaxAttempts, snapshot.Config.Routing.MaxAttempts)
 	}
 
@@ -142,12 +185,92 @@ func TestUpdateValidatesMaxAttemptsRange(t *testing.T) {
 	}
 
 	input = snapshot.Config
-	input.Routing.MaxAttempts = 201
+	input.Routing.MaxAttempts = 65536
 	if _, err := service.Update(context.Background(), snapshot.Revision, input); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("maxAttempts above maximum error = %v", err)
 	}
 	if repository.value.Routing.MaxAttempts != -1 {
 		t.Fatalf("invalid maxAttempts was persisted: %d", repository.value.Routing.MaxAttempts)
+	}
+}
+
+func TestUpdatePreservesBuildChatDeniedPolicyWhenFieldIsOmitted(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Routing.MarkBuildChatDeniedAsReauth = true
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.Routing.MarkBuildChatDeniedAsReauth = false
+	input.Routing.MarkBuildChatDeniedAsReauthProvided = false
+
+	if _, err := service.Update(context.Background(), 0, input); err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Routing.MarkBuildChatDeniedAsReauth || !repository.value.Routing.MarkBuildChatDeniedAsReauth {
+		t.Fatalf("omitted Build chat denied policy was overwritten: applied=%t persisted=%t", applied.Routing.MarkBuildChatDeniedAsReauth, repository.value.Routing.MarkBuildChatDeniedAsReauth)
+	}
+}
+
+func TestUpdatePreservesAccountIsolationWhenFieldIsOmitted(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Routing.AccountIsolatedConnections = true
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.Routing.AccountIsolatedConnections = false
+	input.Routing.AccountIsolatedConnectionsProvided = false
+
+	snapshot, err := service.Update(context.Background(), 0, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Routing.AccountIsolatedConnections || repository.value.Routing.AccountIsolatedConnections == nil || !*repository.value.Routing.AccountIsolatedConnections {
+		t.Fatal("omitted account isolation setting was overwritten")
+	}
+
+	input = snapshot.Config
+	input.Routing.AccountIsolatedConnections = false
+	input.Routing.AccountIsolatedConnectionsProvided = true
+	if _, err := service.Update(context.Background(), snapshot.Revision, input); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Routing.AccountIsolatedConnections || repository.value.Routing.AccountIsolatedConnections == nil || *repository.value.Routing.AccountIsolatedConnections {
+		t.Fatal("explicit account isolation update was ignored")
+	}
+}
+
+func TestLoadPersistedKeepsAccountIsolationDefaultForOlderPayload(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Routing.AccountIsolatedConnections = true
+	value := toDomainConfig(cfg)
+	value.Routing.AccountIsolatedConnections = nil
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Routing.AccountIsolatedConnections {
+		t.Fatal("older persisted payload disabled config.yaml account isolation")
+	}
+}
+
+func TestLoadPersistedPreservesExplicitlyDisabledAccountIsolation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Routing.AccountIsolatedConnections = true
+	value := toDomainConfig(cfg)
+	disabled := false
+	value.Routing.AccountIsolatedConnections = &disabled
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Routing.AccountIsolatedConnections {
+		t.Fatal("explicitly disabled persisted account isolation was ignored")
 	}
 }
 
@@ -207,6 +330,24 @@ func TestLoadPersistedKeepsConsoleDefaultsWhenFieldIsMissing(t *testing.T) {
 	}
 	if loaded.Provider.Console != cfg.Provider.Console {
 		t.Fatalf("console config = %#v, want %#v", loaded.Provider.Console, cfg.Provider.Console)
+	}
+}
+
+func TestLoadPersistedBackfillsProviderStreamIdleTimeoutDefaults(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.ProviderWeb.StreamIdleTimeout = 0
+	value.ProviderConsole.StreamIdleTimeout = 0
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Provider.Web.StreamIdleTimeout.Value(); got != settingsdomain.DefaultWebStreamIdleTimeout {
+		t.Fatalf("Web stream idle timeout = %s", got)
+	}
+	if got := loaded.Provider.Console.StreamIdleTimeout.Value(); got != settingsdomain.DefaultConsoleStreamIdleTimeout {
+		t.Fatalf("Console stream idle timeout = %s", got)
 	}
 }
 
@@ -358,6 +499,30 @@ func TestLoadPersistedBackfillsMissingServerConcurrency(t *testing.T) {
 	}
 }
 
+func TestApplyDomainConfigPreservesExplicitCapacitySettings(t *testing.T) {
+	base := testConfig(t)
+	value := toDomainConfig(base)
+	value.Server.MaxConcurrentRequests = 1024
+	value.Routing.CapacityWait = 500 * time.Millisecond
+	value.ProviderWeb.ChatTimeout = 2 * time.Minute
+	value.ClientKeyDefaults.RPMLimit = 120
+	value.ClientKeyDefaults.MaxConcurrent = 8
+
+	applied := applyDomainConfig(base, value)
+	if applied.Server.MaxConcurrentRequests != 1024 {
+		t.Fatalf("maxConcurrentRequests = %d, want 1024", applied.Server.MaxConcurrentRequests)
+	}
+	if applied.Routing.CapacityWait.Value() != 500*time.Millisecond {
+		t.Fatalf("capacityWait = %s, want 500ms", applied.Routing.CapacityWait.Value())
+	}
+	if applied.Provider.Web.ChatTimeout.Value() != 2*time.Minute {
+		t.Fatalf("chatTimeout = %s, want 2m", applied.Provider.Web.ChatTimeout.Value())
+	}
+	if applied.ClientKeyDefaults.RPMLimit != 120 || applied.ClientKeyDefaults.MaxConcurrent != 8 {
+		t.Fatalf("client key defaults = %+v, want 120/8", applied.ClientKeyDefaults)
+	}
+}
+
 func TestLoadPersistedBackfillsMissingConsoleSection(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)
@@ -505,6 +670,7 @@ func TestApplyDomainConfigAccountsDefaults(t *testing.T) {
 			StickyTTL: base.Routing.StickyTTL.Value(), CooldownBase: base.Routing.CooldownBase.Value(),
 			CooldownMax: base.Routing.CooldownMax.Value(), CapacityWait: base.Routing.CapacityWait.Value(),
 			MaxAttempts: base.Routing.MaxAttempts, PreferFreeBuild: base.Routing.PreferFreeBuild,
+			MarkBuildChatDeniedAsReauth: base.Routing.MarkBuildChatDeniedAsReauth,
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: base.Audit.BufferSize, BatchSize: base.Audit.BatchSize, FlushInterval: base.Audit.FlushInterval.Value(),

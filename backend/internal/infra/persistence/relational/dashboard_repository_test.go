@@ -24,6 +24,7 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 	active := &accountModel{IdentityKey: testIdentityKey("active"), Provider: "grok_build", Name: "active", SourceKey: "active", Enabled: true, AuthStatus: "active", MaxConcurrent: 1}
 	exhausted := &accountModel{IdentityKey: testIdentityKey("exhausted"), Provider: "grok_build", Name: "exhausted", SourceKey: "exhausted", Enabled: true, AuthStatus: "active", MaxConcurrent: 1}
 	enabledRoute := &modelRouteModel{PublicID: "enabled", Provider: "grok_build", UpstreamModel: "enabled", Capability: "responses", Enabled: true}
+	internalKind := "quality_guard"
 	rows := []any{
 		active,
 		exhausted,
@@ -32,6 +33,7 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 		&modelRouteModel{PublicID: "disabled", Provider: "grok_build", UpstreamModel: "disabled", Capability: "responses", Enabled: false},
 		&clientKeyModel{Name: "active", Prefix: "gkp_active", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true},
 		&clientKeyModel{Name: "expired", Prefix: "gkp_expired", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, ExpiresAt: timePointer(now.Add(-time.Hour))},
+		&clientKeyModel{Name: "internal", Prefix: "quality-guard-internal", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, InternalKind: &internalKind, Enabled: true},
 	}
 	for _, row := range rows {
 		if err := database.db.WithContext(ctx).Create(row).Error; err != nil {
@@ -107,6 +109,34 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 	}
 	if activityRequests != 3 {
 		t.Fatalf("activity buckets = %#v", snapshot.ActivityBuckets)
+	}
+}
+
+func TestDashboardRepositoryCounts2xxWithErrorAsFailure(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "dashboard-stream-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	audits := []requestAuditModel{
+		{RequestID: "healthy", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", Operation: "responses", UsageSource: "upstream", StatusCode: 200, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "stream-interrupted", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", Operation: "responses", UsageSource: "upstream", StatusCode: 200, Streaming: true, ErrorCode: "upstream_stream_interrupted", CreatedAt: now.Add(-time.Minute)},
+	}
+	if err := database.db.WithContext(ctx).Create(&audits).Error; err != nil {
+		t.Fatal(err)
+	}
+	boundaries := testDashboardBoundaries(now.Add(-time.Hour), time.Hour, 2)
+	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardWindow(boundaries), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Usage.Requests != 2 || snapshot.Usage.SuccessfulRequests != 1 || snapshot.Usage.FailedRequests != 1 {
+		t.Fatalf("usage = %#v", snapshot.Usage)
 	}
 }
 

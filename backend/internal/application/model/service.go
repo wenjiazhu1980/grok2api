@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
@@ -20,6 +21,8 @@ import (
 
 const defaultModelSyncWorkers = 25
 const syncFailurePersistTimeout = 5 * time.Second
+
+var maxModelBatchSize = repository.MaxPageSize * len(modeldomain.Capabilities())
 
 var (
 	ErrInvalidFilter = errors.New("模型筛选条件无效")
@@ -48,6 +51,11 @@ type AccountOption struct {
 	Name string
 }
 
+type RouteGroup struct {
+	Routes               []modeldomain.Route
+	EndpointCapabilities []string
+}
+
 type ListFilter struct {
 	Provider    string
 	Providers   []string
@@ -56,6 +64,8 @@ type ListFilter struct {
 	ActiveScope bool
 	Sort        repository.SortQuery
 }
+
+type SyncProgressObserver func(completed, total int)
 
 // Service 负责上游模型发现、内部来源路由与对外模型名称维护。
 type Service struct {
@@ -95,6 +105,73 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		enabled = &value
 	}
 	return s.models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}, Filter: repository.ModelListFilter{Provider: filter.Provider, Providers: filter.Providers, Tiers: filter.Tiers, Enabled: enabled, ActiveScope: filter.ActiveScope}})
+}
+
+func (s *Service) ListGroups(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]RouteGroup, int64, error) {
+	page, pageSize = normalizePage(page, pageSize)
+	if !validProviderFilter(filter.Provider) || !validModelFilter(filter.Status, "", "enabled", "disabled") || !repository.IsValidSort(filter.Sort, "publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt") {
+		return nil, 0, ErrInvalidFilter
+	}
+	var enabled *bool
+	if filter.Status != "" {
+		value := filter.Status == "enabled"
+		enabled = &value
+	}
+	values, total, err := s.models.ListGroups(ctx, repository.ModelListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+		Filter: repository.ModelListFilter{Provider: filter.Provider, Enabled: enabled},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	groups := make([]RouteGroup, 0, len(values))
+	for _, value := range values {
+		groups = append(groups, RouteGroup{Routes: value.Routes, EndpointCapabilities: s.endpointCapabilities(value.Routes)})
+	}
+	return groups, total, nil
+}
+
+func (s *Service) endpointCapabilities(routes []modeldomain.Route) []string {
+	if len(routes) == 0 || s.providers == nil {
+		return nil
+	}
+	definition, ok := s.providers.Definition(routes[0].Provider)
+	if !ok {
+		return nil
+	}
+	return endpointCapabilitiesForDefinition(routes, definition)
+}
+
+func endpointCapabilitiesForDefinition(routes []modeldomain.Route, definition provider.Definition) []string {
+	available := make(map[string]bool, 6)
+	for _, route := range routes {
+		switch route.Capability {
+		case modeldomain.CapabilityResponses, modeldomain.CapabilityChat:
+			available["completions"] = definition.Conversation.ChatCompletions
+			available["responses"] = definition.Conversation.Responses
+			available["messages"] = definition.Conversation.Messages
+		case modeldomain.CapabilityImage:
+			available["image"] = definition.Media.ImageGeneration
+		case modeldomain.CapabilityImageEdit:
+			available["image_edit"] = definition.Media.ImageEdit
+		case modeldomain.CapabilityVideo:
+			available["video"] = definition.Media.VideoGeneration
+		case modeldomain.CapabilityTTS:
+			available["tts"] = definition.Media.TTS
+		case modeldomain.CapabilitySTT:
+			available["stt"] = definition.Media.STT
+		case modeldomain.CapabilityRealtime:
+			available["realtime"] = definition.Media.Realtime
+		}
+	}
+	order := []string{"completions", "responses", "messages", "image", "image_edit", "video", "tts", "stt", "realtime"}
+	result := make([]string, 0, len(order))
+	for _, capability := range order {
+		if available[capability] {
+			result = append(result, capability)
+		}
+	}
+	return result
 }
 
 func validProviderFilter(value string) bool {
@@ -241,7 +318,7 @@ func (s *Service) Delete(ctx context.Context, id uint64) error {
 }
 
 func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -320,7 +397,7 @@ func (s *Service) validateBoundAccounts(ctx context.Context, providerValue accou
 
 // BatchSetEnabled 批量更新模型路由启停状态。
 func (s *Service) BatchSetEnabled(ctx context.Context, ids []uint64, enabled bool) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -330,8 +407,13 @@ func (s *Service) BatchSetEnabled(ctx context.Context, ids []uint64, enabled boo
 
 // Sync 从全部启用账号同步模型能力，并按 Provider 幂等更新公开路由表。
 func (s *Service) Sync(ctx context.Context) (int, error) {
+	return s.SyncObserved(ctx, nil)
+}
+
+// SyncObserved 执行全量模型同步，并按已完成账号数报告进度。
+func (s *Service) SyncObserved(ctx context.Context, observer SyncProgressObserver) (int, error) {
 	result := s.syncAll.DoChan("all", func() (any, error) {
-		return s.syncAllAccounts(ctx)
+		return s.syncAllAccounts(ctx, observer)
 	})
 	select {
 	case <-ctx.Done():
@@ -344,7 +426,7 @@ func (s *Service) Sync(ctx context.Context) (int, error) {
 	}
 }
 
-func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
+func (s *Service) syncAllAccounts(ctx context.Context, observer SyncProgressObserver) (int, error) {
 	if s.providers == nil {
 		return 0, fmt.Errorf("Provider 注册表未初始化")
 	}
@@ -363,12 +445,20 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 	if len(credentials) == 0 {
 		return 0, fmt.Errorf("没有可用于模型同步的账号")
 	}
-	results, summary, runErr := batch.Map(ctx, credentials, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
+	if observer != nil {
+		observer(0, len(credentials))
+	}
+	var completed atomic.Int64
+	results, summary, runErr := batch.MapObserved(ctx, credentials, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
 		adapter, ok := s.providers.Models(value.Provider)
 		if !ok {
 			return nil, fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
 		}
 		return s.syncAccountCapabilities(workCtx, value, adapter)
+	}, func(_ int, _ batch.Result[[]string]) {
+		if observer != nil {
+			observer(int(completed.Add(1)), len(credentials))
+		}
 	})
 	pool := s.bulkPool.Snapshot()
 	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_queued", pool.Queued, "pool_peak", pool.Peak, "error", runErr)
@@ -533,11 +623,19 @@ func normalizePage(page, pageSize int) (int, int) {
 }
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, repository.MaxPageSize, "模型")
+}
+
+func normalizeModelRouteBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, maxModelBatchSize, "模型能力路由")
+}
+
+func normalizeIDs(ids []uint64, limit int, label string) ([]uint64, error) {
 	if len(ids) == 0 {
 		return nil, invalidInput("至少选择一个模型")
 	}
-	if len(ids) > repository.MaxPageSize {
-		return nil, invalidInput(fmt.Sprintf("单次最多处理 %d 个模型", repository.MaxPageSize))
+	if len(ids) > limit {
+		return nil, invalidInput(fmt.Sprintf("单次最多处理 %d 条%s", limit, label))
 	}
 	seen := make(map[uint64]struct{}, len(ids))
 	result := make([]uint64, 0, len(ids))

@@ -2,10 +2,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -28,6 +30,29 @@ type HTTPStatusError interface {
 	HTTPStatusCode() int
 }
 
+// RetryAfterError preserves a safe upstream retry delay when an adapter cannot
+// return a Response, for example when a WebSocket handshake is rejected.
+type RetryAfterError interface {
+	error
+	RetryAfterDuration() time.Duration
+}
+
+// RequestScopedError marks an upstream rejection that retrying with another
+// account or egress cannot resolve.
+type RequestScopedError interface {
+	error
+	RequestScopedFailure() bool
+}
+
+// PublicMessageError exposes a deliberately sanitized message that may cross
+// the public API boundary. Provider errors must opt in; arbitrary Error()
+// strings can contain upstream response bodies, tokens, cookies, or request
+// diagnostics and therefore are never returned to clients by default.
+type PublicMessageError interface {
+	error
+	PublicErrorMessage() string
+}
+
 // ErrorHTTPStatus extracts the upstream HTTP status from a Provider error chain.
 func ErrorHTTPStatus(err error) (int, bool) {
 	var statusError HTTPStatusError
@@ -36,6 +61,137 @@ func ErrorHTTPStatus(err error) (int, bool) {
 	}
 	status := statusError.HTTPStatusCode()
 	return status, status > 0
+}
+
+// VideoStage identifies which phase of an asynchronous video job failed.
+type VideoStage string
+
+const (
+	// VideoStagePrepare is local work performed before the create request is sent.
+	// It is not account-failover eligible because retrying deterministic local
+	// validation or configuration failures against another credential is useless.
+	VideoStagePrepare VideoStage = "prepare"
+	// VideoStageCreate means the upstream explicitly rejected the create request.
+	// Account failover is safe only for the retryable 4xx statuses selected by
+	// the gateway; 5xx responses remain indeterminate because work may already
+	// have been accepted before the server failed.
+	VideoStageCreate VideoStage = "create"
+	// VideoStageSubmitted means the create request may have reached upstream but
+	// no usable job identifier was obtained. Retrying could duplicate work.
+	VideoStageSubmitted VideoStage = "submitted"
+	VideoStagePoll      VideoStage = "poll"
+)
+
+// VideoStageError records the asynchronous video phase without treating every
+// create-path error as safe for account failover.
+type VideoStageError struct {
+	Stage  VideoStage
+	Status int
+	Err    error
+}
+
+func (e *VideoStageError) Error() string {
+	if e == nil {
+		return "video request failed"
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.Status > 0 {
+		return fmt.Sprintf("video %s failed with status %d", e.Stage, e.Status)
+	}
+	return fmt.Sprintf("video %s failed", e.Stage)
+}
+
+func (e *VideoStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *VideoStageError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	if e.Status > 0 {
+		return e.Status
+	}
+	return ErrorHTTPStatusOrZero(e.Err)
+}
+
+// ErrorHTTPStatusOrZero extracts an upstream status or returns 0.
+func ErrorHTTPStatusOrZero(err error) int {
+	status, ok := ErrorHTTPStatus(err)
+	if !ok {
+		return 0
+	}
+	return status
+}
+
+// VideoErrorStage reports the video phase for an error chain.
+func VideoErrorStage(err error) (VideoStage, bool) {
+	var stageErr *VideoStageError
+	if !errors.As(err, &stageErr) || stageErr == nil || stageErr.Stage == "" {
+		return "", false
+	}
+	return stageErr.Stage, true
+}
+
+// VideoCreateFailureStage distinguishes an explicit upstream rejection from an
+// indeterminate POST result. Explicit 4xx responses (including the 401
+// sentinel) are rejections; transport errors and 5xx responses remain
+// submitted because the upstream may already have accepted the job.
+func VideoCreateFailureStage(err error) VideoStage {
+	if errors.Is(err, ErrUnauthorized) {
+		return VideoStageCreate
+	}
+	if status, ok := ErrorHTTPStatus(err); ok && status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return VideoStageCreate
+	}
+	return VideoStageSubmitted
+}
+
+// WrapVideoStage annotates err with the video phase and optional HTTP status.
+func WrapVideoStage(stage VideoStage, status int, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *VideoStageError
+	if errors.As(err, &existing) {
+		return err
+	}
+	if status <= 0 {
+		status = ErrorHTTPStatusOrZero(err)
+	}
+	return &VideoStageError{Stage: stage, Status: status, Err: err}
+}
+
+// ErrorRetryAfter extracts a positive retry delay from an error chain.
+func ErrorRetryAfter(err error) time.Duration {
+	var retryError RetryAfterError
+	if !errors.As(err, &retryError) {
+		return 0
+	}
+	return max(0, retryError.RetryAfterDuration())
+}
+
+// IsRequestScopedError reports whether the Provider has positively classified
+// the failure as request-scoped.
+func IsRequestScopedError(err error) bool {
+	var requestError RequestScopedError
+	return errors.As(err, &requestError) && requestError.RequestScopedFailure()
+}
+
+// ErrorPublicMessage extracts a message that the Provider has explicitly
+// classified as safe for clients.
+func ErrorPublicMessage(err error) (string, bool) {
+	var publicError PublicMessageError
+	if !errors.As(err, &publicError) {
+		return "", false
+	}
+	message := strings.TrimSpace(publicError.PublicErrorMessage())
+	return message, message != ""
 }
 
 // MediaPostProcessingStage identifies a local processing stage that failed after media generation.
@@ -123,6 +279,9 @@ func (e *CredentialRefreshError) Unwrap() error {
 // ResponseResourceRequest describes a common upstream request to a Responses resource endpoint.
 type ResponseResourceRequest struct {
 	Credential account.Credential
+	// ForcedEgressNodeID is set only by administrator quality probes. It lets a
+	// healthy credential test a quarantined node without changing its binding.
+	ForcedEgressNodeID uint64
 	// Billing is used only to determine XAI eligibility in Build auto mode; nil means the account tier is unknown.
 	Billing        *account.Billing
 	Method         string
@@ -235,6 +394,17 @@ type QuotaSnapshot struct {
 	SyncedAt time.Time
 }
 
+// QuotaGroupSnapshot is an authoritative snapshot for a group of quota modes
+// returned by one upstream request. Modes lists the complete local scope so
+// callers can atomically remove products that the upstream explicitly reports
+// as unavailable without touching unrelated quota windows.
+type QuotaGroupSnapshot struct {
+	Group    string
+	Modes    []string
+	Windows  []account.QuotaWindow
+	SyncedAt time.Time
+}
+
 type ImageGenerationRequest struct {
 	Credential     account.Credential
 	Model          string
@@ -243,6 +413,7 @@ type ImageGenerationRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
@@ -263,23 +434,47 @@ type ImageEditRequest struct {
 	Size           string
 	AspectRatio    string
 	Resolution     string
+	Quality        string
 	ResponseFormat string
 	Streaming      bool
 	PartialImages  int
 }
+
+// VideoOperation selects the official xAI video endpoint family.
+type VideoOperation = media.VideoOperation
+
+const (
+	VideoOperationGenerate = media.VideoOperationGenerate
+	VideoOperationEdit     = media.VideoOperationEdit
+	VideoOperationExtend   = media.VideoOperationExtend
+)
 
 type VideoRequest struct {
 	Credential account.Credential
 	// Billing is used only to determine XAI eligibility in Build auto mode; nil means the account tier is unknown.
 	Billing *account.Billing
 	// JobID binds the local video job to XAI ZDR upload tickets and result assets.
-	JobID         string
-	Prompt        string
-	Duration      int
-	AspectRatio   string
-	Resolution    string
+	JobID string
+	// Model is the selected upstream video model when the Provider supports more than one.
+	Model string
+	// Operation defaults to generate when empty.
+	Operation   VideoOperation
+	Prompt      string
+	Duration    int
+	AspectRatio string
+	Resolution  string
+	// ImageURL is the optional first-frame image (official "image" field).
+	ImageURL string
+	// ReferenceURLs are style/content references (official "reference_images").
+	// A single reference must stay in reference_images and must not be coerced to image.
+	// Official docs forbid combining image with reference_images.
 	ReferenceURLs []string
-	Progress      func(int)
+	// ReferenceAudios are preset voice_ids for reference-to-video (official "reference_audios").
+	// At most 3 entries; may be used alone or with reference_images.
+	ReferenceAudios []string
+	// VideoURL is required for edit/extend (official "video" field).
+	VideoURL string
+	Progress func(int)
 }
 
 type VideoResult struct {
@@ -287,6 +482,91 @@ type VideoResult struct {
 	ContentType string
 	// A non-empty AssetID means the result is stored as a local media asset; content reads must use MediaObjectStorage.
 	AssetID string
+}
+
+type TTSOutputFormat struct {
+	Codec      string
+	SampleRate int
+	BitRate    int
+}
+
+type TTSRequest struct {
+	Credential               account.Credential
+	Model                    string
+	Text                     string
+	VoiceID                  string
+	Language                 string
+	OutputFormat             TTSOutputFormat
+	Speed                    float64
+	OptimizeStreamingLatency int
+	TextNormalization        bool
+	WithTimestamps           bool
+}
+
+type TTSTimestampSpan struct {
+	Start float64
+	End   float64
+}
+
+type TTSTimestamps struct {
+	GraphChars []string
+	GraphTimes []TTSTimestampSpan
+}
+
+type TTSResult struct {
+	Audio        []byte
+	ContentType  string
+	Duration     float64
+	Base64Audio  string
+	Timestamps   *TTSTimestamps
+	JSONEnvelope bool
+}
+
+type STTRequest struct {
+	Credential   account.Credential
+	Model        string
+	FileName     string
+	FileMIME     string
+	FileData     []byte
+	URL          string
+	AudioFormat  string
+	SampleRate   string
+	Language     string
+	Format       bool
+	Multichannel bool
+	Channels     int
+	Diarize      bool
+	KeyTerms     []string
+	FillerWords  bool
+	VADThreshold *float64
+}
+
+type STTWord struct {
+	Text    string
+	Start   float64
+	End     float64
+	Speaker *int
+}
+
+type STTChannel struct {
+	Index int
+	Text  string
+	Words []STTWord
+}
+
+type STTResult struct {
+	Text     string
+	Language string
+	Duration float64
+	Words    []STTWord
+	Channels []STTChannel
+	RawJSON  []byte
+}
+
+type VoiceInfo struct {
+	VoiceID  string
+	Name     string
+	Language string
 }
 
 // RefreshedCredential represents rotated credentials returned by an OAuth refresh.
@@ -344,7 +624,13 @@ type CredentialCodecAdapter interface {
 // CredentialMetadata contains non-sensitive display data safely derived from a stored credential.
 // Raw tokens and complete JWT claims must never be exposed through this structure.
 type CredentialMetadata struct {
+	// BuildBotFlagInspected is true only when the Build token was successfully
+	// decrypted and decoded. False means the risk source is unknown, not clean.
+	BuildBotFlagInspected bool
+	// BuildBotFlagged is true when BuildBotFlagSource is 1 or 2.
 	BuildBotFlagged bool
+	// BuildBotFlagSource is the numeric bot_flag_source/bfs claim (1 or 2), or 0 when unset.
+	BuildBotFlagSource int
 }
 
 type CredentialMetadataAdapter interface {
@@ -374,6 +660,20 @@ type QuotaAdapter interface {
 	Adapter
 	SyncQuota(ctx context.Context, credential account.Credential) (QuotaSnapshot, error)
 	SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error)
+}
+
+// QuotaGroupAdapter is optional. It is used when one upstream endpoint returns
+// several related quota products as one authoritative response.
+type QuotaGroupAdapter interface {
+	Adapter
+	SyncQuotaGroup(ctx context.Context, credential account.Credential, group string) (QuotaGroupSnapshot, error)
+}
+
+// QuotaRefreshMetadataAdapter maps a model to an internal refresh group. The
+// group is scheduling metadata, not a routable quota mode.
+type QuotaRefreshMetadataAdapter interface {
+	Adapter
+	QuotaRefreshGroup(upstreamModel string) string
 }
 
 // WebAccountSettingsAdapter defines upstream profile-setting capabilities for Grok Web SSO accounts.
@@ -413,6 +713,42 @@ type VideoAdapter interface {
 type VideoContentDownloader interface {
 	VideoAdapter
 	DownloadVideo(ctx context.Context, credential account.Credential, rawURL string) (io.ReadCloser, string, int64, error)
+}
+
+// TTSAdapter synthesizes speech audio for text prompts.
+type TTSAdapter interface {
+	Adapter
+	SynthesizeSpeech(ctx context.Context, request TTSRequest) (TTSResult, error)
+	ListTTSVoices(ctx context.Context, credential account.Credential) ([]VoiceInfo, error)
+	GetTTSVoice(ctx context.Context, credential account.Credential, voiceID string) (VoiceInfo, error)
+}
+
+// STTAdapter transcribes audio into text.
+type STTAdapter interface {
+	Adapter
+	TranscribeSpeech(ctx context.Context, request STTRequest) (STTResult, error)
+}
+
+// VoiceWebSocketConn is a minimal duplex websocket used by voice streaming proxies.
+type VoiceWebSocketConn interface {
+	ReadMessage() (messageType int, data []byte, err error)
+	WriteMessage(messageType int, data []byte) error
+	SetReadLimit(limit int64)
+	Close() error
+}
+
+// VoiceWebSocketRequest dials an upstream voice websocket with provider auth.
+type VoiceWebSocketRequest struct {
+	Credential account.Credential
+	// Path is a v1-relative path such as /realtime or /stt.
+	Path  string
+	Model string
+}
+
+// VoiceWebSocketAdapter dials official voice websocket endpoints with account auth.
+type VoiceWebSocketAdapter interface {
+	Adapter
+	DialVoiceWebSocket(ctx context.Context, request VoiceWebSocketRequest) (VoiceWebSocketConn, func(), error)
 }
 
 type RoutingMetadataAdapter interface {
@@ -596,6 +932,21 @@ func (r *Registry) Validate() error {
 				return fmt.Errorf("Provider %s 声明视频能力但未实现适配器", value)
 			}
 		}
+		if definition.Media.TTS {
+			if _, ok := adapter.(TTSAdapter); !ok {
+				return fmt.Errorf("Provider %s 声明语音合成能力但未实现适配器", value)
+			}
+		}
+		if definition.Media.STT {
+			if _, ok := adapter.(STTAdapter); !ok {
+				return fmt.Errorf("Provider %s 声明语音识别能力但未实现适配器", value)
+			}
+		}
+		if definition.Media.Realtime {
+			if _, ok := adapter.(VoiceWebSocketAdapter); !ok {
+				return fmt.Errorf("Provider %s 声明实时语音能力但未实现 WebSocket 适配器", value)
+			}
+		}
 	}
 	return nil
 }
@@ -738,6 +1089,15 @@ func (r *Registry) Quota(value account.Provider) (QuotaAdapter, bool) {
 	return result, ok
 }
 
+func (r *Registry) QuotaGroup(value account.Provider) (QuotaGroupAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(QuotaGroupAdapter)
+	return result, ok
+}
+
 // WebAccountSettings returns the Grok Web-specific account profile settings capability.
 func (r *Registry) WebAccountSettings() (WebAccountSettingsAdapter, bool) {
 	adapter, ok := r.Get(account.ProviderWeb)
@@ -758,6 +1118,18 @@ func (r *Registry) QuotaMode(value account.Provider, upstreamModel string) strin
 		return ""
 	}
 	return metadata.QuotaMode(upstreamModel)
+}
+
+func (r *Registry) QuotaRefreshGroup(value account.Provider, upstreamModel string) string {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return ""
+	}
+	metadata, ok := adapter.(QuotaRefreshMetadataAdapter)
+	if !ok {
+		return ""
+	}
+	return metadata.QuotaRefreshGroup(upstreamModel)
 }
 
 func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
@@ -814,4 +1186,149 @@ func (r *Registry) Videos(value account.Provider) (VideoAdapter, bool) {
 	}
 	result, ok := adapter.(VideoAdapter)
 	return result, ok
+}
+
+func (r *Registry) TTS(value account.Provider) (TTSAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(TTSAdapter)
+	return result, ok
+}
+
+func (r *Registry) STT(value account.Provider) (STTAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(STTAdapter)
+	return result, ok
+}
+
+func (r *Registry) VoiceWebSocket(value account.Provider) (VoiceWebSocketAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(VoiceWebSocketAdapter)
+	return result, ok
+}
+
+// CredentialRejection 表示上游响应或错误是否构成「凭据被拒」的稳定判定。
+// 与网关 UpstreamFailure 的 CredentialRejected / PermanentAccountDenial / SpendingLimitBlocked 分类保持一致，
+// 供 account.Service 等非网关路径复用同一套失效收敛语义。
+type CredentialRejection struct {
+	// Rejected 表示该响应/错误应被认定为凭据级失效（需标 reauthRequired）。
+	Rejected bool
+	// PermanentAccountDenial 表示上游明确拒绝该账号访问聊天端点（非凭据本身失效）。
+	// Build 账号此类拒绝按现有网关逻辑是 model-scoped，不应标 reauth；仅 Rejected 为真时才标。
+	// 管理端 detect 路径同样仅持久化模型阻断，避免把仍可用于其他模型的账号移出号池。
+	PermanentAccountDenial bool
+	// SpendingLimitBlocked 表示付费账号被 spending-limit 永久阻断（402/403 personal-team-blocked:spending-limit），
+	// 由调用方写入额度恢复状态，不应误判为 OAuth 凭据失效。
+	SpendingLimitBlocked bool
+	// QuotaExhausted 表示请求被账号级或模型级额度限制拒绝。
+	QuotaExhausted bool
+	// FreeQuotaExhausted 表示免费额度已经耗尽。
+	FreeQuotaExhausted bool
+	// ModelQuotaExhausted 表示额度限制只针对当前模型。
+	ModelQuotaExhausted bool
+}
+
+// ClassifyCredentialRejection 按上游 HTTP 状态码与错误体判定凭据是否被拒。
+// status 为上游 HTTP 状态；body 为响应正文（可为 nil）；err 为 Provider 返回的错误（可为 nil）。
+func ClassifyCredentialRejection(status int, body []byte, err error) CredentialRejection {
+	var result CredentialRejection
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			result.Rejected = true
+			return result
+		}
+		if httpStatus, ok := ErrorHTTPStatus(err); ok && httpStatus == http.StatusUnauthorized {
+			result.Rejected = true
+			return result
+		}
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		result.Rejected = true
+	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		upstreamCode, upstreamType, upstreamMessage := ExtractUpstreamErrorMetadata(body)
+		metadataText := strings.ToLower(strings.Join([]string{upstreamCode, upstreamType, upstreamMessage}, " "))
+		result.SpendingLimitBlocked = strings.Contains(metadataText, "personal-team-blocked:spending-limit")
+		result.ModelQuotaExhausted = strings.Contains(metadataText, "used all the included free usage for model")
+		result.FreeQuotaExhausted = result.ModelQuotaExhausted || strings.Contains(metadataText, "subscription:free-usage-exhausted")
+		creditExhausted := ContainsAny(metadataText, "run out of credits", "out of credits", "usage balance exhausted", "usage limit reached")
+		result.QuotaExhausted = status == http.StatusPaymentRequired || result.SpendingLimitBlocked || result.FreeQuotaExhausted || creditExhausted
+		permanentDenial := IsPermanentAccountDenial(metadataText)
+		result.PermanentAccountDenial = permanentDenial
+		if status == http.StatusForbidden {
+			result.Rejected = !result.QuotaExhausted && !permanentDenial && ContainsAny(metadataText,
+				"authentication", "unauthorized", "invalid token", "token expired")
+		}
+	}
+	return result
+}
+
+// ExtractUpstreamErrorMetadata 从上游错误响应正文中提取 code/type/message 三元组。
+func ExtractUpstreamErrorMetadata(body []byte) (string, string, string) {
+	if len(body) == 0 {
+		return "", "", ""
+	}
+	var payload any
+	if json.Unmarshal(body, &payload) != nil {
+		return "", "", strings.TrimSpace(string(body))
+	}
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return "", "", ""
+	}
+	if nested, ok := root["error"].(map[string]any); ok {
+		code := FirstNonEmptyFailure(firstStringValue(nested, "code", "error_code"), firstStringValue(root, "code", "error_code"))
+		errorType := FirstNonEmptyFailure(firstStringValue(nested, "type", "error_type"), firstStringValue(root, "type", "error_type"))
+		message := FirstNonEmptyFailure(firstStringValue(nested, "message", "error"), firstStringValue(root, "message"))
+		return code, errorType, message
+	}
+	message := FirstNonEmptyFailure(firstStringValue(root, "error"), firstStringValue(root, "message"))
+	return firstStringValue(root, "code", "error_code"), firstStringValue(root, "type", "error_type"), message
+}
+
+// IsPermanentAccountDenial 判定 403 是否为「账号被永久拒绝访问聊天端点」。
+func IsPermanentAccountDenial(text string) bool {
+	if strings.Contains(text, "access to the chat endpoint is denied") {
+		return true
+	}
+	return strings.Trim(strings.TrimSpace(text), " .!\t\r\n") == "access denied"
+}
+
+// ContainsAny 报告 text 是否包含任意一个 signal 子串。
+func ContainsAny(text string, signals ...string) bool {
+	for _, signal := range signals {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstStringValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			if s, ok := value.(string); ok {
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return ""
+}
+
+// FirstNonEmptyFailure 返回第一个非空白字符串。
+func FirstNonEmptyFailure(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

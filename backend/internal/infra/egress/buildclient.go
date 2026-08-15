@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/bdandy/go-socks4"
+	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -17,6 +18,17 @@ import (
 // the official CLI-facing transport. Browser TLS impersonation is reserved for
 // Grok Web, where the browser fingerprint and User-Agent belong together.
 func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions(proxyURL, responseHeaderTimeout, false)
+}
+
+// newBuildEnvironmentClient preserves the process-wide Build direct
+// transport's HTTP_PROXY/HTTPS_PROXY behavior while giving the caller an
+// independent connection pool.
+func newBuildEnvironmentClient(responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions("", responseHeaderTimeout, true)
+}
+
+func newBuildClientWithOptions(proxyURL string, responseHeaderTimeout time.Duration, environmentProxy bool) (*http.Client, error) {
 	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
@@ -29,6 +41,9 @@ func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
+	}
+	if environmentProxy {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
 	if strings.TrimSpace(proxyURL) != "" {
 		parsed, err := url.Parse(proxyURL)
@@ -44,6 +59,12 @@ func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http
 				return nil, fmt.Errorf("创建 Grok Build SOCKS 代理: %w", err)
 			}
 			transport.DialContext = dialContext(dialer)
+		case "trojan", "vless", "ss", "vmess":
+			dialer, err := tunnelproxy.NewDialer(proxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("创建 Grok Build 隧道代理: %w", err)
+			}
+			transport.DialContext = dialer.DialContext
 		default:
 			return nil, fmt.Errorf("Grok Build 不支持代理协议 %q", parsed.Scheme)
 		}

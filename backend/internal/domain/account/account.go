@@ -196,6 +196,9 @@ type Credential struct {
 	// 不替代 Billing 快照，不等同于 BuildAPIFallback，也不表示请求应走 XAI。
 	// 普通导入/upsert/token refresh/SSO 转换不得清除；仅显式管理员 PATCH 可改。
 	BuildSuperEntitled bool
+	// BuildBotFlagSource 是从 Build access token 提取并持久化的非敏感路由元数据。
+	// 仅精确值 1、2 表示风控；0 表示未标记或非 Build 账号。
+	BuildBotFlagSource int
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -266,7 +269,28 @@ const (
 	QuotaSourceUpstream  QuotaSource = "upstream"
 )
 
-// QuotaWindow 表示 Grok Web 单个模式的请求额度窗口。
+const (
+	QuotaModeWebImagePro  = "image_pro"
+	QuotaModeWebImageEdit = "image_edit"
+	QuotaModeWebVideo     = "video"
+	QuotaModeWebVideo720p = "video_720p"
+	QuotaGroupWebImagine  = "web_imagine"
+)
+
+func WebImagineQuotaModes() []string {
+	return []string{QuotaModeWebImagePro, QuotaModeWebImageEdit, QuotaModeWebVideo, QuotaModeWebVideo720p}
+}
+
+func IsWebImagineQuotaMode(mode string) bool {
+	switch mode {
+	case QuotaModeWebImagePro, QuotaModeWebImageEdit, QuotaModeWebVideo, QuotaModeWebVideo720p:
+		return true
+	default:
+		return false
+	}
+}
+
+// QuotaWindow 表示 Provider 单个模式的额度窗口。
 type QuotaWindow struct {
 	AccountID     uint64
 	Mode          string

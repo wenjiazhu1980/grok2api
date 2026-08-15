@@ -16,6 +16,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
@@ -29,39 +32,94 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 	return fn(request)
 }
 
+func TestResponseRequestForcedEgressOverridesCredentialBinding(t *testing.T) {
+	var gotNodeID uint64
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, nil)
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		gotNodeID = infraegress.EgressNodeFromContext(request.Context())
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Request:    request,
+		}, nil
+	})
+	response, _, err := adapter.doResponseRequest(context.Background(), provider.ResponseResourceRequest{
+		Credential:         account.Credential{ID: 7, Provider: account.ProviderBuild, EgressNodeID: 11},
+		ForcedEgressNodeID: 22,
+		Method:             http.MethodPost,
+		Path:               "/responses",
+	}, "access-token", nil, "https://cli-chat-proxy.grok.com/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if gotNodeID != 22 {
+		t.Fatalf("egress node=%d, want forced node=22", gotNodeID)
+	}
+}
+
 func TestAdapterHotUpdatesDirectResponseHeaderTimeout(t *testing.T) {
-	adapter := NewAdapter(Config{ResponseHeaderTimeout: 2 * time.Minute}, nil)
+	adapter := NewAdapter(Config{ResponseHeaderTimeout: 2 * time.Minute, StreamIdleTimeout: 3 * time.Minute}, nil)
 	before := adapter.base.current.Load()
 	if before.ResponseHeaderTimeout != 2*time.Minute {
 		t.Fatalf("initial timeout = %s", before.ResponseHeaderTimeout)
 	}
-	adapter.UpdateConfig(Config{ResponseHeaderTimeout: 7 * time.Minute})
+	if got := adapter.config().StreamIdleTimeout; got != 3*time.Minute {
+		t.Fatalf("initial stream idle timeout = %s", got)
+	}
+	adapter.UpdateConfig(Config{ResponseHeaderTimeout: 7 * time.Minute, StreamIdleTimeout: 11 * time.Minute})
 	after := adapter.base.current.Load()
 	if after == before || after.ResponseHeaderTimeout != 7*time.Minute {
 		t.Fatalf("updated transport=%p timeout=%s", after, after.ResponseHeaderTimeout)
 	}
+	if got := adapter.config().StreamIdleTimeout; got != 11*time.Minute {
+		t.Fatalf("updated stream idle timeout = %s", got)
+	}
 }
 
-func TestCredentialMetadataMarksOnlyNumericBotFlagOne(t *testing.T) {
+func TestAdapterDefaultsStreamIdleTimeout(t *testing.T) {
+	adapter := NewAdapter(Config{}, nil)
+	if got := adapter.config().StreamIdleTimeout; got != settingsdomain.DefaultBuildStreamIdleTimeout {
+		t.Fatalf("stream idle timeout = %s, want %s", got, settingsdomain.DefaultBuildStreamIdleTimeout)
+	}
+}
+
+func TestCredentialMetadataMarksNumericBotFlagOneOrTwo(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	adapter := NewAdapter(Config{}, cipher)
 	tests := []struct {
-		name     string
-		provider account.Provider
-		claims   map[string]any
-		token    string
-		want     bool
+		name       string
+		provider   account.Provider
+		claims     map[string]any
+		token      string
+		wantFlag   bool
+		wantSource int
 	}{
-		{name: "numeric one", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 1}, want: true},
+		{name: "numeric one", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 1}, wantFlag: true, wantSource: 1},
+		{name: "bfs numeric one", provider: account.ProviderBuild, claims: map[string]any{"bfs": 1}, wantFlag: true, wantSource: 1},
+		{name: "numeric two", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 2}, wantFlag: true, wantSource: 2},
+		{name: "bfs numeric two", provider: account.ProviderBuild, claims: map[string]any{"bfs": 2}, wantFlag: true, wantSource: 2},
+		{name: "bfs preferred when bot_flag_source missing", provider: account.ProviderBuild, claims: map[string]any{"bfs": 1, "sub": "user"}, wantFlag: true, wantSource: 1},
+		{name: "either claim one is enough", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 0, "bfs": 1}, wantFlag: true, wantSource: 1},
+		{name: "bot_flag_source preferred over bfs", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 1, "bfs": 2}, wantFlag: true, wantSource: 1},
+		{name: "bot_flag_source two preferred over bfs one", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 2, "bfs": 1}, wantFlag: true, wantSource: 2},
 		{name: "numeric zero", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 0}},
-		{name: "numeric two", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 2}},
+		{name: "bfs numeric zero", provider: account.ProviderBuild, claims: map[string]any{"bfs": 0}},
+		{name: "numeric three", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 3}},
+		{name: "fractional one", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": 1.5}},
+		{name: "bfs fractional two", provider: account.ProviderBuild, claims: map[string]any{"bfs": 2.5}},
 		{name: "string one", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": "1"}},
+		{name: "bfs string one", provider: account.ProviderBuild, claims: map[string]any{"bfs": "1"}},
+		{name: "string two", provider: account.ProviderBuild, claims: map[string]any{"bot_flag_source": "2"}},
 		{name: "missing claim", provider: account.ProviderBuild, claims: map[string]any{"sub": "user"}},
 		{name: "malformed jwt", provider: account.ProviderBuild, token: "not-a-jwt"},
 		{name: "non build", provider: account.ProviderWeb, claims: map[string]any{"bot_flag_source": 1}},
+		{name: "non build bfs two", provider: account.ProviderWeb, claims: map[string]any{"bfs": 2}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -78,15 +136,37 @@ func TestCredentialMetadataMarksOnlyNumericBotFlagOne(t *testing.T) {
 				t.Fatal(encryptErr)
 			}
 			metadata := adapter.CredentialMetadata(account.Credential{Provider: test.provider, EncryptedAccessToken: encrypted})
-			if metadata.BuildBotFlagged != test.want {
-				t.Fatalf("flagged = %t, want %t", metadata.BuildBotFlagged, test.want)
+			wantInspected := test.provider == account.ProviderBuild && test.claims != nil
+			if metadata.BuildBotFlagInspected != wantInspected {
+				t.Fatalf("inspected = %t, want %t", metadata.BuildBotFlagInspected, wantInspected)
+			}
+			if metadata.BuildBotFlagged != test.wantFlag || metadata.BuildBotFlagSource != test.wantSource {
+				t.Fatalf("flagged/source = %t/%d, want %t/%d", metadata.BuildBotFlagged, metadata.BuildBotFlagSource, test.wantFlag, test.wantSource)
 			}
 		})
 	}
 
 	metadata := adapter.CredentialMetadata(account.Credential{Provider: account.ProviderBuild, EncryptedAccessToken: "invalid-ciphertext"})
-	if metadata.BuildBotFlagged {
+	if metadata.BuildBotFlagInspected || metadata.BuildBotFlagged || metadata.BuildBotFlagSource != 0 {
 		t.Fatal("decrypt failure must not mark the account")
+	}
+}
+
+func TestBuildBotFlagSourceFromClaims(t *testing.T) {
+	if buildBotFlagSourceFromClaims(nil) != 0 {
+		t.Fatal("nil claims must not flag")
+	}
+	if source := buildBotFlagSourceFromClaims(map[string]any{"bfs": float64(1)}); source != 1 {
+		t.Fatalf("bfs=1 source = %d", source)
+	}
+	if source := buildBotFlagSourceFromClaims(map[string]any{"bot_flag_source": float64(2)}); source != 2 {
+		t.Fatalf("bot_flag_source=2 source = %d", source)
+	}
+	if !buildBotFlaggedFromClaims(map[string]any{"bfs": float64(2)}) {
+		t.Fatal("bfs=2 must flag")
+	}
+	if buildBotFlaggedFromClaims(map[string]any{"bfs": "1", "bot_flag_source": "2"}) {
+		t.Fatal("string values must not flag")
 	}
 }
 
@@ -366,6 +446,45 @@ func TestListModelsUsesOfficialMetadataHeaders(t *testing.T) {
 	}
 }
 
+func TestListModelsParsesOfficialIdentifierFallbacksAdditively(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, cipher)
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `{"data":[
+			{"id":"grok-4.5","model":"must-not-replace-id"},
+			{"model":"grok-composer-2.5-fast"},
+			{"modelId":"future-model"},
+			{"_meta":{"model":"meta-model"}},
+			{"_meta":{"modelId":"meta-id-model"}},
+			{"id":"hidden-model","hidden":true},
+			{"id":"meta-hidden-model","_meta":{"hidden":true}},
+			{"id":"grok-4.5"},
+			"malformed"
+		]}`
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+	models, err := adapter.ListModels(context.Background(), account.Credential{EncryptedAccessToken: encrypted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"grok-4.5", modeldomain.GrokComposer25Fast, "future-model", "meta-model", "meta-id-model"}
+	if len(models) != len(want) {
+		t.Fatalf("models = %#v, want %#v", models, want)
+	}
+	for index := range want {
+		if models[index] != want[index] {
+			t.Fatalf("models = %#v, want %#v", models, want)
+		}
+	}
+}
+
 func TestModelCatalogETagSignalsMissingOrChangedCatalogBaseline(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
@@ -498,6 +617,48 @@ func TestNormalizeAccountModelCapabilitiesSuperAddsVideo15(t *testing.T) {
 	got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5"}, &account.Billing{IsUnifiedBillingUser: true}, entitled)
 	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != buildVideoModel {
 		t.Fatalf("entitled catalog = %#v", got)
+	}
+}
+
+func TestNormalizeAccountModelCapabilitiesAddsComposerOnlyForBuildOAuth(t *testing.T) {
+	adapter := &Adapter{}
+	oauth := account.Credential{Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth}
+	got := adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5"}, &account.Billing{PlanName: "free"}, oauth)
+	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast {
+		t.Fatalf("OAuth Free capabilities = %#v", got)
+	}
+	got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5", modeldomain.GrokComposer25Fast, modeldomain.GrokComposer25Fast}, nil, oauth)
+	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast {
+		t.Fatalf("Composer capability was not deduplicated: %#v", got)
+	}
+	for _, credential := range []account.Credential{
+		{Provider: account.ProviderBuild, AuthType: account.AuthTypeSSO},
+		{Provider: account.ProviderWeb, AuthType: account.AuthTypeOAuth},
+	} {
+		got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5"}, nil, credential)
+		if len(got) != 1 || got[0] != "grok-4.5" {
+			t.Fatalf("Composer leaked outside Build OAuth for %#v: %#v", credential, got)
+		}
+	}
+}
+
+func TestNormalizeAccountModelCapabilitiesKeepsGrok45ForBuildGrok46(t *testing.T) {
+	adapter := &Adapter{}
+	build := account.Credential{Provider: account.ProviderBuild}
+	got := adapter.NormalizeAccountModelCapabilities([]string{buildGrok46Model}, nil, build)
+	if len(got) != 2 || got[0] != buildGrok46Model || got[1] != buildGrok45Model {
+		t.Fatalf("Build Grok 4.6 compatibility capabilities = %#v", got)
+	}
+
+	got = adapter.NormalizeAccountModelCapabilities([]string{buildGrok45Model, buildGrok46Model, buildGrok45Model}, nil, build)
+	if len(got) != 2 || got[0] != buildGrok45Model || got[1] != buildGrok46Model {
+		t.Fatalf("Build Grok 4.5 compatibility was not deduplicated: %#v", got)
+	}
+
+	console := account.Credential{Provider: account.ProviderConsole}
+	got = adapter.NormalizeAccountModelCapabilities([]string{buildGrok46Model}, nil, console)
+	if len(got) != 1 || got[0] != buildGrok46Model {
+		t.Fatalf("Build compatibility leaked to Console: %#v", got)
 	}
 }
 
@@ -905,6 +1066,10 @@ func TestForwardResponseInjectsPromptCacheKeyAfterChatConversion(t *testing.T) {
 		var payload map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
+		}
+		includes, _ := payload["include"].([]any)
+		if payload["store"] != false || len(includes) != 1 || includes[0] != "reasoning.encrypted_content" {
+			t.Fatalf("Build defaults = %#v", payload)
 		}
 		expectedSessionID, err := grokSessionID("chat-cache-key")
 		if err != nil {

@@ -68,6 +68,13 @@ func TestRoutingMutationsNotifyAfterCommit(t *testing.T) {
 	if err := models.UpsertDiscovered(ctx, account.ProviderBuild, []string{"model-a"}); err != nil {
 		t.Fatal(err)
 	}
+	if len(events) != 1 || events[0].Kind != repository.InvalidationRouteChanged {
+		t.Fatalf("managed route creation events = %#v", events)
+	}
+	events = events[:0]
+	if err := models.UpsertDiscovered(ctx, account.ProviderBuild, []string{"model-a"}); err != nil {
+		t.Fatal(err)
+	}
 	if len(events) != 0 {
 		t.Fatalf("unchanged discovered routes emitted invalidation: %#v", events)
 	}
@@ -79,6 +86,53 @@ func TestRoutingMutationsNotifyAfterCommit(t *testing.T) {
 	}
 	if len(events) != before {
 		t.Fatalf("failed transaction emitted invalidation: %#v", events[before:])
+	}
+}
+
+func TestAccountHealthMutationPublishesPreciseInvalidation(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "health-invalidation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "health", SourceKey: "health", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []repository.InvalidationEvent
+	accounts.SetInvalidationObserver(func(_ context.Context, event repository.InvalidationEvent) {
+		events = append(events, event)
+	})
+	cooldownUntil := time.Now().UTC().Add(time.Minute)
+	if err := accounts.UpdateHealth(ctx, credential.ID, account.ProviderWeb, 2, &cooldownUntil, "wrong provider", false); err != repository.ErrNotFound {
+		t.Fatalf("mismatched provider error = %v, want not found", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("mismatched provider emitted invalidation: %#v", events)
+	}
+	if err := accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 2, &cooldownUntil, "upstream status 429", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("health events = %#v", events)
+	}
+	event := events[0]
+	if event.Kind != repository.InvalidationAccountHealthChanged || event.Provider != account.ProviderBuild || event.AccountID != credential.ID || event.FailureCount != 2 || event.CooldownUntil == nil || !event.CooldownUntil.Equal(cooldownUntil) {
+		t.Fatalf("health event = %#v", event)
+	}
+	if err := accounts.TouchLastUsed(ctx, credential.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("last-used touch emitted routing invalidation: %#v", events[1:])
 	}
 }
 

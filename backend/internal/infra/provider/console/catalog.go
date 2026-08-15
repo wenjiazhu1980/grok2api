@@ -7,37 +7,61 @@ import (
 )
 
 const (
-	QuotaMode          = "console"
-	DefaultQuotaLimit  = 20
-	DefaultQuotaWindow = 3600
+	QuotaMode      = "console"
+	QuotaModeImage = "console_image"
+	QuotaModeVideo = "console_video"
 )
 
 type ModelSpec struct {
-	PublicID               string
-	UpstreamModel          string
-	SupportsReasoning      bool
-	DefaultReasoningEffort string
-	MaxOutputTokens        int
-	SearchTools            bool
+	PublicID                string
+	UpstreamModel           string
+	SupportsReasoning       bool
+	SupportsReasoningEffort bool
+	DefaultReasoningEffort  string
+	MaxOutputTokens         int
 }
 
 var catalog = []ModelSpec{
-	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309", UpstreamModel: "grok-4.20-0309", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", SupportsReasoning: true, MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309-non-reasoning", UpstreamModel: "grok-4.20-0309-non-reasoning", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-multi-agent-0309", UpstreamModel: "grok-4.20-multi-agent-0309", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 2_000_000, SearchTools: true},
-	{PublicID: "grok-build-0.1", UpstreamModel: "grok-build-0.1", MaxOutputTokens: 256_000, SearchTools: true},
+	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, SupportsReasoningEffort: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", SupportsReasoning: true, MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-0309-non-reasoning", UpstreamModel: "grok-4.20-0309-non-reasoning", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-multi-agent-0309", UpstreamModel: "grok-4.20-multi-agent-0309", SupportsReasoning: true, SupportsReasoningEffort: true, MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.5", UpstreamModel: "grok-4.5", SupportsReasoning: true, SupportsReasoningEffort: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-build-0.1", UpstreamModel: "grok-build-0.1", MaxOutputTokens: 256_000},
 }
 
-// Effort-suffixed aliases only include levels each model actually supports
-// (see domain/model.SupportedReasoningEfforts). No blanket none/low/medium/high/xhigh/max template.
+var mediaCatalog = []struct {
+	PublicID      string
+	UpstreamModel string
+	Capabilities  []modeldomain.Capability
+}{
+	// Keep the three official Console image products distinct. The legacy and
+	// quality routes intentionally precede 2.0 so catalog reconciliation can
+	// restore stable route IDs created before 2.0 was introduced.
+	{PublicID: "grok-imagine-image", UpstreamModel: "grok-imagine-image", Capabilities: []modeldomain.Capability{modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit}},
+	{PublicID: "grok-imagine-image-quality", UpstreamModel: "grok-imagine-image-quality", Capabilities: []modeldomain.Capability{modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit}},
+	{PublicID: "grok-imagine-image-2.0", UpstreamModel: "grok-imagine-image-2.0", Capabilities: []modeldomain.Capability{modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit}},
+	{PublicID: "grok-imagine-video", UpstreamModel: "grok-imagine-video", Capabilities: []modeldomain.Capability{modeldomain.CapabilityVideo}},
+	// Free Console accounts can use the 1.5 video model on the official Console media API.
+	{PublicID: "grok-imagine-video-1.5", UpstreamModel: "grok-imagine-video-1.5", Capabilities: []modeldomain.Capability{modeldomain.CapabilityVideo}},
+	{PublicID: "grok-voice-latest", UpstreamModel: "grok-voice-latest", Capabilities: []modeldomain.Capability{modeldomain.CapabilityRealtime, modeldomain.CapabilityTTS}},
+	{PublicID: "grok-voice-think-fast-2.0", UpstreamModel: "grok-voice-think-fast-2.0", Capabilities: []modeldomain.Capability{modeldomain.CapabilityRealtime, modeldomain.CapabilityTTS}},
+	{PublicID: "grok-voice-think-fast-1.0", UpstreamModel: "grok-voice-think-fast-1.0", Capabilities: []modeldomain.Capability{modeldomain.CapabilityRealtime, modeldomain.CapabilityTTS}},
+	{PublicID: "grok-stt", UpstreamModel: "grok-stt", Capabilities: []modeldomain.Capability{modeldomain.CapabilitySTT}},
+}
+
+// Effort-suffixed aliases only include levels each Provider/model combination
+// actually supports (see domain/model.SupportedReasoningEffortsForProvider).
+// No blanket none/low/medium/high/xhigh/max template.
 var aliases = []provider.ModelAlias{
+	// Compatibility for the temporary PR catalog name. The official quality
+	// model itself remains a first-class route.
+	consoleAlias("grok-imagine-image-quality-2.0", "grok-imagine-image-quality", "grok-imagine-image-quality", ""),
 	consoleAlias("grok-4.3-console", "grok-4.3", "grok-4.3", ""),
-	consoleAlias("grok-4.20-0309-console", "grok-4.20-0309", "grok-4.20-0309", ""),
 	consoleAlias("grok-4.20-0309-reasoning-console", "grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning", ""),
 	consoleAlias("grok-4.20-0309-non-reasoning-console", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning", ""),
 	consoleAlias("grok-4.20-multi-agent-console", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", ""),
+	consoleAlias("grok-4.5-console", "grok-4.5", "grok-4.5", ""),
 	consoleAlias("grok-build-console", "grok-build-0.1", "grok-build-0.1", ""),
 	consoleAlias("grok-4.3-low", "grok-4.3", "grok-4.3", "low"),
 	consoleAlias("grok-4.3-medium", "grok-4.3", "grok-4.3", "medium"),
@@ -59,13 +83,26 @@ func consoleAlias(alias, publicModel, upstreamModel, effort string) provider.Mod
 func Catalog() []ModelSpec { return append([]ModelSpec(nil), catalog...) }
 
 func Routes() []modeldomain.Route {
-	values := make([]modeldomain.Route, 0, len(catalog))
+	capacity := len(catalog)
+	for _, spec := range mediaCatalog {
+		capacity += len(spec.Capabilities)
+	}
+	values := make([]modeldomain.Route, 0, capacity)
 	for _, spec := range catalog {
 		publicID, _ := modeldomain.NormalizePublicID(account.ProviderConsole, spec.PublicID)
 		values = append(values, modeldomain.Route{
 			PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: spec.UpstreamModel,
 			Capability: modeldomain.CapabilityResponses, Enabled: true,
 		})
+	}
+	for _, spec := range mediaCatalog {
+		publicID, _ := modeldomain.NormalizePublicID(account.ProviderConsole, spec.PublicID)
+		for _, capability := range spec.Capabilities {
+			values = append(values, modeldomain.Route{
+				PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: spec.UpstreamModel,
+				Capability: capability, Enabled: true,
+			})
+		}
 	}
 	return values
 }
@@ -77,6 +114,31 @@ func Resolve(upstreamModel string) (ModelSpec, bool) {
 		}
 	}
 	return ModelSpec{}, false
+}
+
+func ResolveMedia(upstreamModel string, capability modeldomain.Capability) bool {
+	for _, spec := range mediaCatalog {
+		if spec.UpstreamModel != upstreamModel {
+			continue
+		}
+		for _, supported := range spec.Capabilities {
+			if supported == capability {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func allModels() []string {
+	values := make([]string, 0, len(catalog)+len(mediaCatalog))
+	for _, spec := range catalog {
+		values = append(values, spec.UpstreamModel)
+	}
+	for _, spec := range mediaCatalog {
+		values = append(values, spec.UpstreamModel)
+	}
+	return values
 }
 
 func Aliases() []provider.ModelAlias { return append([]provider.ModelAlias(nil), aliases...) }

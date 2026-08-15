@@ -41,7 +41,7 @@ func TestSchemaAndRepositoryConstraints(t *testing.T) {
 	if err := accountRepo.UpdateObservedModel(context.Background(), created.ID, "grok-observed", observedAt); err != nil {
 		t.Fatal(err)
 	}
-	if err := accountRepo.UpdateHealth(context.Background(), created.ID, 0, nil, "", true); err != nil {
+	if err := accountRepo.UpdateHealth(context.Background(), created.ID, created.Provider, 0, nil, "", true); err != nil {
 		t.Fatal(err)
 	}
 	value.Name = "updated"
@@ -256,6 +256,47 @@ func TestAccountRepositoryDecrementsQuotaByAmountAtomically(t *testing.T) {
 	}
 }
 
+func TestAccountRepositoryReplacesQuotaGroupWithoutTouchingOtherModes(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "quota-group", SourceKey: "quota-group",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	initial := []account.QuotaWindow{
+		{AccountID: value.ID, Mode: "weekly", Remaining: 90, Total: 100, UpdatedAt: now},
+		{AccountID: value.ID, Mode: account.QuotaModeWebImagePro, Remaining: 4, UpdatedAt: now},
+		{AccountID: value.ID, Mode: account.QuotaModeWebVideo720p, Remaining: 1, UpdatedAt: now},
+	}
+	if err := repo.SaveQuotaWindows(ctx, value.ID, account.WebTierSuper, now, initial); err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := now.Add(time.Minute)
+	if err := repo.ReplaceQuotaWindowGroup(ctx, value.ID, updatedAt, account.WebImagineQuotaModes(), []account.QuotaWindow{
+		{AccountID: value.ID, Mode: account.QuotaModeWebImagePro, Remaining: 3, UpdatedAt: updatedAt},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	windows, err := repo.GetQuotaWindows(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMode := make(map[string]account.QuotaWindow)
+	for _, window := range windows[value.ID] {
+		byMode[window.Mode] = window
+	}
+	if byMode["weekly"].Remaining != 90 || byMode[account.QuotaModeWebImagePro].Remaining != 3 {
+		t.Fatalf("windows = %#v", windows[value.ID])
+	}
+	if _, exists := byMode[account.QuotaModeWebVideo720p]; exists {
+		t.Fatalf("explicitly unavailable group mode was preserved: %#v", windows[value.ID])
+	}
+}
+
 func TestAccountRepositorySummarizesOperationalStates(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -273,7 +314,7 @@ func TestAccountRepositorySummarizesOperationalStates(t *testing.T) {
 	create(account.ProviderBuild, "build-active")
 	cooldown := create(account.ProviderBuild, "build-cooldown")
 	cooldownUntil := now.Add(time.Hour)
-	if err := repo.UpdateHealth(ctx, cooldown.ID, 1, &cooldownUntil, "cooldown", false); err != nil {
+	if err := repo.UpdateHealth(ctx, cooldown.ID, cooldown.Provider, 1, &cooldownUntil, "cooldown", false); err != nil {
 		t.Fatal(err)
 	}
 	disabled := create(account.ProviderBuild, "build-disabled")
@@ -465,7 +506,11 @@ func TestFreshSchemaContract(t *testing.T) {
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
 	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "first_token_ms"}, nil)
-	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id", "model_route_id"})
+	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "model_route_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id"})
+	assertTableColumns(t, database, "media_assets", []string{"expires_at"}, nil)
+	if !database.db.Migrator().HasIndex(&mediaAssetModel{}, "idx_media_assets_expires") {
+		t.Fatal("missing media asset expiry index")
+	}
 	var requestAuditSQL string
 	if err := database.db.Raw("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'request_audits'").Scan(&requestAuditSQL).Error; err != nil {
 		t.Fatal(err)

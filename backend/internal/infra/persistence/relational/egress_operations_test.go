@@ -309,6 +309,48 @@ func TestEgressOperationsRejectsIncompatibleSourceScopeChangeWithBindings(t *tes
 	}
 }
 
+func TestEgressOperationsListsSourcePagesByScopeAndSearch(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	service := egressapp.NewService(nodes, egressOperationsCipher(t), "test-browser")
+	url := "https://subscription.example/proxies"
+	for _, input := range []egressapp.SubscriptionSourceInput{
+		{Name: "Alpha Build", Scope: egress.ScopeBuild, Enabled: true, URL: &url},
+		{Name: "beta build", Scope: egress.ScopeBuild, Enabled: true, URL: &url},
+		{Name: "Alpha Web", Scope: egress.ScopeWeb, Enabled: true, URL: &url},
+	} {
+		if _, err := service.CreateSource(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, total, err := service.ListSourcePage(ctx, 1, 1, "BUILD", egressapp.SourceListFilter{Scope: egress.ScopeBuild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(first) != 1 || first[0].Name != "Alpha Build" {
+		t.Fatalf("first page = %#v, total = %d", first, total)
+	}
+	second, total, err := service.ListSourcePage(ctx, 2, 1, "build", egressapp.SourceListFilter{Scope: egress.ScopeBuild})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(second) != 1 || second[0].Name != "beta build" {
+		t.Fatalf("second page = %#v, total = %d", second, total)
+	}
+	web, total, err := service.ListSourcePage(ctx, 1, 100, "alpha", egressapp.SourceListFilter{Scope: egress.ScopeWeb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(web) != 1 || web[0].Name != "Alpha Web" {
+		t.Fatalf("web page = %#v, total = %d", web, total)
+	}
+	if _, _, err := service.ListSourcePage(ctx, 1, 20, "", egressapp.SourceListFilter{Scope: egress.Scope("invalid")}); !errors.Is(err, egressapp.ErrInvalidFilter) {
+		t.Fatalf("invalid scope error = %v", err)
+	}
+}
+
 func TestEgressOperationsAutoAssignSkipsCoolingFixedNode(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
@@ -617,6 +659,10 @@ func TestEgressOperationsPersistsProbeResult(t *testing.T) {
 	nodes := NewEgressRepository(database)
 	cipher := egressOperationsCipher(t)
 	node := createHealthyEgressNode(t, ctx, nodes, cipher, "probe", 0)
+	cooldown := time.Now().UTC().Add(time.Minute)
+	if err := nodes.UpdateEgressNodeHealth(ctx, node.ID, 0.7, 1, &cooldown, egress.LastErrorTransport); err != nil {
+		t.Fatal(err)
+	}
 	probedAt := time.Now().UTC().Truncate(time.Millisecond)
 	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
 	service.SetNodeProber(egressProbeStub{result: egress.ProbeResult{
@@ -642,6 +688,22 @@ func TestEgressOperationsPersistsProbeResult(t *testing.T) {
 	}
 	if stored.IPv4Probe.ExitIP != "1.1.1.1" || stored.IPv6Probe.ExitIP != "2606:4700:4700::1111" || stored.IPv6Probe.Status != egress.ProbeStatusHealthy {
 		t.Fatalf("stored family probes = ipv4:%#v ipv6:%#v", stored.IPv4Probe, stored.IPv6Probe)
+	}
+	if stored.Health != 1 || stored.FailureCount != 0 || stored.CooldownUntil != nil || stored.LastError != "" {
+		t.Fatalf("healthy probe did not recover transport failure: %#v", stored)
+	}
+	if err := nodes.UpdateEgressNodeHealth(ctx, node.ID, 0.7, 1, &cooldown, "anti-bot rejection"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.TestNode(ctx, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = nodes.GetEgressNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Health != 0.7 || stored.FailureCount != 1 || stored.CooldownUntil == nil || stored.LastError != "anti-bot rejection" {
+		t.Fatalf("healthy probe cleared a non-transport failure: %#v", stored)
 	}
 	updatedConfig, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
 		ProbeProvider: egress.ProbeProviderIPInfo, ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
@@ -728,16 +790,17 @@ func TestEgressOperationsStoresSubscriptionURLEncrypted(t *testing.T) {
 	cipher := egressOperationsCipher(t)
 	service := egressapp.NewService(nodes, cipher, "test-browser", accounts)
 	url := "https://subscription.example/proxies?token=subscription-token"
+	proxyURL := "socks5h://proxy-user:proxy-secret@proxy.example:1080"
 	interval := 900
 	capacity := 3
 	created, err := service.CreateSource(ctx, egressapp.SubscriptionSourceInput{
-		Name: "source", Scope: egress.ScopeBuild, Enabled: true, URL: &url,
+		Name: "source", Scope: egress.ScopeBuild, Enabled: true, URL: &url, ProxyURL: &proxyURL,
 		RefreshIntervalSeconds: &interval, DefaultAccountCapacity: &capacity,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !created.URLConfigured || created.DefaultAccountCapacity != capacity {
+	if !created.URLConfigured || !created.ProxyConfigured || created.DefaultAccountCapacity != capacity {
 		t.Fatalf("public source = %#v", created)
 	}
 	stored, err := nodes.GetEgressSource(ctx, created.ID)
@@ -746,6 +809,79 @@ func TestEgressOperationsStoresSubscriptionURLEncrypted(t *testing.T) {
 	}
 	if stored.EncryptedURL == url || strings.Contains(stored.EncryptedURL, "subscription-token") {
 		t.Fatalf("subscription URL stored in plaintext: %q", stored.EncryptedURL)
+	}
+	if stored.EncryptedProxyURL == proxyURL || strings.Contains(stored.EncryptedProxyURL, "proxy-secret") {
+		t.Fatalf("subscription proxy URL stored in plaintext: %q", stored.EncryptedProxyURL)
+	}
+	originalEncryptedProxyURL := stored.EncryptedProxyURL
+
+	updated, err := service.UpdateSource(ctx, created.ID, egressapp.SubscriptionSourceInput{
+		Name: created.Name, Scope: created.Scope, Enabled: created.Enabled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.ProxyConfigured {
+		t.Fatal("omitted proxy update cleared the configured proxy")
+	}
+	stored, err = nodes.GetEgressSource(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EncryptedProxyURL != originalEncryptedProxyURL {
+		t.Fatal("omitted proxy update replaced the encrypted proxy")
+	}
+
+	replacementProxyURL := "http://replacement-user:replacement-secret@proxy.example:8080"
+	updated, err = service.UpdateSource(ctx, created.ID, egressapp.SubscriptionSourceInput{
+		Name: created.Name, Scope: created.Scope, Enabled: created.Enabled, ProxyURL: &replacementProxyURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err = nodes.GetEgressSource(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decryptedProxyURL, err := cipher.Decrypt(stored.EncryptedProxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decryptedProxyURL != replacementProxyURL || !updated.ProxyConfigured {
+		t.Fatalf("replacement proxy = %q, public source = %#v", decryptedProxyURL, updated)
+	}
+
+	for _, invalidProxyURL := range []string{"", "socks5h://Default.{account}:secret@proxy.example:1080"} {
+		_, updateErr := service.UpdateSource(ctx, created.ID, egressapp.SubscriptionSourceInput{
+			Name: created.Name, Scope: created.Scope, Enabled: created.Enabled, ProxyURL: &invalidProxyURL,
+		})
+		if !errors.Is(updateErr, egressapp.ErrInvalidInput) {
+			t.Fatalf("invalid proxy %q error = %v", invalidProxyURL, updateErr)
+		}
+	}
+	stored, err = nodes.GetEgressSource(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EncryptedProxyURL == "" {
+		t.Fatal("invalid proxy update modified the configured proxy")
+	}
+
+	updated, err = service.UpdateSource(ctx, created.ID, egressapp.SubscriptionSourceInput{
+		Name: created.Name, Scope: created.Scope, Enabled: created.Enabled, ClearProxyURL: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ProxyConfigured {
+		t.Fatal("cleared subscription proxy remains publicly configured")
+	}
+	stored, err = nodes.GetEgressSource(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EncryptedProxyURL != "" {
+		t.Fatal("cleared subscription proxy remains encrypted at rest")
 	}
 }
 
@@ -822,8 +958,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	saved, err := service.UpdateOperationsConfig(ctx, egressapp.OperationsConfigInput{
 		ProbeProvider: egress.ProbeProviderCloudflare, ProbeIntervalSeconds: 900, AssignmentIntervalSeconds: 300,
 		Fallbacks: map[egress.Scope]egressapp.FallbackConfigInput{
-			egress.ScopeBuild: {Mode: egress.FallbackModeFixed, NodeID: fixed.ID},
-			egress.ScopeWeb:   {Mode: egress.FallbackModeDirect},
+			egress.ScopeBuild:        {Mode: egress.FallbackModeFixed, NodeID: fixed.ID},
+			egress.ScopeWeb:          {Mode: egress.FallbackModeDirect},
+			egress.ScopeConsoleAsset: {Mode: egress.FallbackModeDirect},
 		},
 	})
 	if err != nil {
@@ -841,6 +978,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	if fallback := saved.FallbackFor(egress.ScopeConsole); fallback.Mode != egress.FallbackModeNone || fallback.NodeID != 0 {
 		t.Fatalf("default Console fallback = %#v", fallback)
 	}
+	if fallback := saved.FallbackFor(egress.ScopeConsoleAsset); fallback.Mode != egress.FallbackModeDirect || fallback.NodeID != 0 {
+		t.Fatalf("saved Console asset fallback = %#v", fallback)
+	}
 
 	stored, err := nodes.GetEgressOperationsConfig(ctx)
 	if err != nil {
@@ -851,6 +991,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	}
 	if fallback := stored.FallbackFor(egress.ScopeWeb); fallback.Mode != egress.FallbackModeDirect || fallback.NodeID != 0 {
 		t.Fatalf("stored Web fallback = %#v", fallback)
+	}
+	if fallback := stored.FallbackFor(egress.ScopeConsoleAsset); fallback.Mode != egress.FallbackModeDirect || fallback.NodeID != 0 {
+		t.Fatalf("stored Console asset fallback = %#v", fallback)
 	}
 	if stored.ProbeProvider != egress.ProbeProviderCloudflare {
 		t.Fatalf("stored probe provider = %q", stored.ProbeProvider)
@@ -866,6 +1009,9 @@ func TestEgressOperationsConfigPersistsFixedFallback(t *testing.T) {
 	}
 	if fallback := updated.FallbackFor(egress.ScopeWeb); fallback.Mode != egress.FallbackModeDirect {
 		t.Fatalf("sparse update reset Web fallback = %#v", fallback)
+	}
+	if fallback := updated.FallbackFor(egress.ScopeConsoleAsset); fallback.Mode != egress.FallbackModeDirect {
+		t.Fatalf("sparse update reset Console asset fallback = %#v", fallback)
 	}
 }
 

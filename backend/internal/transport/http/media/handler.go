@@ -8,16 +8,20 @@ import (
 	"strings"
 
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
+	"github.com/chenyme/grok2api/backend/internal/pkg/mediafile"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
 	"github.com/gin-gonic/gin"
 )
 
 type Handler struct {
-	service *mediaapp.Service
+	service     *mediaapp.Service
+	ingestSlots chan struct{}
 }
 
-func NewHandler(service *mediaapp.Service) *Handler { return &Handler{service: service} }
+func NewHandler(service *mediaapp.Service) *Handler {
+	return &Handler{service: service, ingestSlots: make(chan struct{}, ingestConcurrency)}
+}
 
 // RegisterPublic 注册使用不可猜测资源 ID 的公开图片读取与视频上传接收端点。
 // 上传 PUT 不使用客户端 API key：xAI 无法携带，票据本身即授权。
@@ -34,6 +38,8 @@ func (h *Handler) RegisterAdmin(router *gin.RouterGroup) {
 	router.GET("/media/images", h.listImages)
 	router.DELETE("/media/images", h.deleteImages)
 	router.GET("/media/images/stats", h.imageStats)
+	router.POST("/media/inputs/import", h.importInputImageFromURL)
+	router.POST("/media/inputs/upload", h.uploadInputAsset)
 	router.GET("/media/videos", h.listVideos)
 	router.DELETE("/media/videos", h.deleteVideos)
 	router.GET("/media/videos/stats", h.videoStats)
@@ -94,7 +100,7 @@ func (h *Handler) getVideo(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", asset.MIMEType)
-	c.Header("Content-Disposition", `inline; filename="`+asset.ID+`"`)
+	c.Header("Content-Disposition", mediafile.VideoContentDisposition(asset.ID, asset.MIMEType))
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	c.Header("ETag", `"`+asset.SHA256+`"`)
 	c.Header("X-Content-Type-Options", "nosniff")

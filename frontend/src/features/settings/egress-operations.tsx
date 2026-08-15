@@ -34,6 +34,7 @@ import {
   type EgressSourceDTO,
   type EgressSourceInput,
 } from "@/features/settings/settings-api";
+import { validSubscriptionProxyURL } from "@/features/settings/settings-model";
 import { formatDateTime } from "@/shared/lib/format";
 import { ErrorState, LoadingState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableFilters } from "@/shared/components/data-table-filters";
@@ -41,26 +42,27 @@ import { DataTableShell } from "@/shared/components/data-table-shell";
 import { Pagination } from "@/shared/components/pagination";
 import { VirtualTableBody } from "@/shared/components/virtual-table-body";
 
-type SourceForm = EgressSourceInput & { url: string };
+type SourceForm = Omit<EgressSourceInput, "url" | "proxyURL" | "clearProxyURL"> & { url: string; proxyEnabled: boolean; proxyURL: string };
 const emptySource: SourceForm = {
-  name: "", scope: "grok_build", enabled: true, url: "", refreshIntervalSeconds: 900, defaultAccountCapacity: 0,
+  name: "", scope: "grok_build", enabled: true, url: "", proxyEnabled: false, proxyURL: "", refreshIntervalSeconds: 900, defaultAccountCapacity: 0,
 };
 // Eight nodes run concurrently; each checks IPv4 and IPv6 in parallel with a
 // 15-second ceiling. Keeping a request to 32 nodes leaves enough headroom for
 // the admin HTTP timeout.
 const egressProbeBatchSize = 32;
-const fallbackScopes: EgressScope[] = ["grok_build", "grok_web", "grok_console", "grok_web_asset"];
+const fallbackScopes: EgressScope[] = ["grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"];
 const fallbackDescriptionKeys: Record<EgressScope, string> = {
   grok_build: "settings.egress.fallbackBuildHelp",
   grok_web: "settings.egress.fallbackWebHelp",
   grok_console: "settings.egress.fallbackConsoleHelp",
   grok_web_asset: "settings.egress.fallbackWebAssetHelp",
+  grok_console_asset: "settings.egress.fallbackConsoleAssetHelp",
 };
 
 function defaultFallbacks(): Record<EgressScope, EgressFallbackConfigDTO> {
   return {
     grok_build: { mode: "none" }, grok_web: { mode: "none" },
-    grok_console: { mode: "none" }, grok_web_asset: { mode: "none" },
+    grok_console: { mode: "none" }, grok_web_asset: { mode: "none" }, grok_console_asset: { mode: "none" },
   };
 }
 
@@ -83,6 +85,7 @@ function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOpera
       grok_web: { ...defaults.grok_web, ...value.fallbacks.grok_web },
       grok_console: { ...defaults.grok_console, ...value.fallbacks.grok_console },
       grok_web_asset: { ...defaults.grok_web_asset, ...value.fallbacks.grok_web_asset },
+      grok_console_asset: { ...defaults.grok_console_asset, ...value.fallbacks.grok_console_asset },
     },
   };
 }
@@ -248,7 +251,7 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
   const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
   const [scopeFilter, setScopeFilter] = useState("");
-  const sourcesQuery = useQuery({ queryKey: ["egress-sources"], queryFn: listEgressSources });
+  const sourcesQuery = useQuery({ queryKey: ["egress-sources"], queryFn: () => listEgressSources() });
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] });
@@ -256,7 +259,13 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
   };
   const saveSource = useMutation({
     mutationFn: () => {
-      const input: EgressSourceInput = { ...sourceForm, url: sourceForm.url.trim() || undefined };
+      const input: EgressSourceInput = {
+        name: sourceForm.name, scope: sourceForm.scope, enabled: sourceForm.enabled,
+        url: sourceForm.url.trim() || undefined,
+        proxyURL: sourceForm.proxyEnabled ? (sourceForm.proxyURL.trim() || undefined) : undefined,
+        clearProxyURL: Boolean(sourceEditing?.proxyConfigured && !sourceForm.proxyEnabled),
+        refreshIntervalSeconds: sourceForm.refreshIntervalSeconds, defaultAccountCapacity: sourceForm.defaultAccountCapacity,
+      };
       return sourceEditing ? updateEgressSource(sourceEditing.id, input) : createEgressSource(input);
     },
     onSuccess: () => { if (!sourceEditing) setPage(1); invalidate(); setSourceEditing(undefined); toast.success(t("settings.egress.sourceSaved")); },
@@ -281,7 +290,7 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
     }
     setSourceForm({
       name: value.name, scope: value.scope, enabled: value.enabled, url: "", refreshIntervalSeconds: value.refreshIntervalSeconds,
-      defaultAccountCapacity: value.defaultAccountCapacity,
+      proxyEnabled: value.proxyConfigured, proxyURL: "", defaultAccountCapacity: value.defaultAccountCapacity,
     });
     setSourceEditing(value);
   }
@@ -296,6 +305,7 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
   const currentPage = Math.min(page, pageCount);
   const pagedSources = filteredSources.slice((currentPage - 1) * pageSize, currentPage * pageSize);
   const hasActiveFilters = Boolean(normalizedSearch || scopeFilter);
+  const sourceProxyInvalid = sourceForm.proxyEnabled && Boolean(sourceForm.proxyURL.trim()) && !validSubscriptionProxyURL(sourceForm.proxyURL);
 
   return (
     <section className="space-y-3">
@@ -315,6 +325,7 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
                   { value: "grok_web", label: scopeLabel("grok_web") },
                   { value: "grok_console", label: scopeLabel("grok_console") },
                   { value: "grok_web_asset", label: scopeLabel("grok_web_asset") },
+                  { value: "grok_console_asset", label: scopeLabel("grok_console_asset") },
                 ],
               }]} />
             </div>
@@ -324,14 +335,15 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
         footer={filteredSources.length > 0 ? <Pagination page={currentPage} pageSize={pageSize} total={filteredSources.length} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} /> : undefined}
       >
         {sourcesQuery.isError ? <ErrorState message={sourcesQuery.error.message} onRetry={() => void sourcesQuery.refetch()} /> : null}
-        {!sourcesQuery.isError ? <Table viewportRows={10} rowHeight={48} className="min-w-[640px] table-fixed">
-          <TableHeader><TableRow className="hover:bg-transparent"><TableHead className="w-[24%]">{t("settings.egress.source")}</TableHead><TableHead className="w-[18%] text-center">{t("settings.egress.scope")}</TableHead><TableHead className="w-[38%]">{t("settings.egress.lastSync")}</TableHead><TableHead className="w-[15%] text-center">{t("settings.egress.capacity")}</TableHead><TableActionHead /></TableRow></TableHeader>
-          {sourcesQuery.isPending ? <TableBody><TableLoadingRow colSpan={5} /></TableBody> : null}
-          {!sourcesQuery.isPending && pagedSources.length === 0 ? <TableBody><TableRow><TableCell colSpan={5} className="h-24 text-center text-xs text-muted-foreground">{hasActiveFilters ? t("settings.egress.noSubscriptionMatches") : t("settings.egress.noSources")}</TableCell></TableRow></TableBody> : null}
-          {!sourcesQuery.isPending && pagedSources.length > 0 ? <VirtualTableBody items={pagedSources} colSpan={5} rowHeight={48} renderRow={(source) => (
+        {!sourcesQuery.isError ? <Table viewportRows={10} rowHeight={48} className="min-w-[720px] table-fixed">
+          <TableHeader><TableRow className="hover:bg-transparent"><TableHead className="w-[22%]">{t("settings.egress.source")}</TableHead><TableHead className="w-[16%] text-center">{t("settings.egress.scope")}</TableHead><TableHead className="w-[13%] text-center">{t("settings.egress.subscriptionRoute")}</TableHead><TableHead className="w-[29%]">{t("settings.egress.lastSync")}</TableHead><TableHead className="w-[15%] text-center">{t("settings.egress.capacity")}</TableHead><TableActionHead /></TableRow></TableHeader>
+          {sourcesQuery.isPending ? <TableBody><TableLoadingRow colSpan={6} /></TableBody> : null}
+          {!sourcesQuery.isPending && pagedSources.length === 0 ? <TableBody><TableRow><TableCell colSpan={6} className="h-24 text-center text-xs text-muted-foreground">{hasActiveFilters ? t("settings.egress.noSubscriptionMatches") : t("settings.egress.noSources")}</TableCell></TableRow></TableBody> : null}
+          {!sourcesQuery.isPending && pagedSources.length > 0 ? <VirtualTableBody items={pagedSources} colSpan={6} rowHeight={48} renderRow={(source) => (
             <TableRow className="group h-12" key={source.id}>
               <TableCell><div className="flex min-w-0 items-center gap-2"><span className={source.enabled ? "size-1.5 shrink-0 rounded-full bg-emerald-500" : "size-1.5 shrink-0 rounded-full bg-muted-foreground/35"} /><span className="truncate text-xs font-medium">{source.name}</span>{source.lastSyncError ? <SourceError message={source.lastSyncError} /> : null}</div></TableCell>
               <TableCell className="text-center"><Badge variant="secondary" className="text-[10px]">{scopeLabel(source.scope)}</Badge></TableCell>
+              <TableCell className="text-center"><Badge variant={source.proxyConfigured ? "secondary" : "outline"} className="text-[10px]">{source.proxyConfigured ? t("settings.egress.subscriptionProxyShort") : t("settings.egress.direct")}</Badge></TableCell>
               <TableCell className="text-xs text-muted-foreground">{source.lastSyncedAt ? formatDateTime(source.lastSyncedAt, i18n.language) : t("settings.egress.never")}</TableCell>
               <TableCell className="text-center text-xs tabular-nums">{source.defaultAccountCapacity || t("settings.egress.unlimited")}</TableCell>
               <TableActionCell>
@@ -355,11 +367,13 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
             <Control label={t("settings.egress.name")}><Input value={sourceForm.name} onChange={(event) => setSourceForm({ ...sourceForm, name: event.target.value })} /></Control>
             <Control label={t("settings.egress.scope")}><ScopeSelect value={sourceForm.scope} onChange={(scope) => setSourceForm({ ...sourceForm, scope })} scopeLabel={scopeLabel} /></Control>
             <Control label={t("settings.egress.subscriptionURL")}><Input type="password" autoComplete="new-password" placeholder={sourceEditing?.urlConfigured ? t("settings.egress.keepConfigured") : "https://..."} value={sourceForm.url} onChange={(event) => setSourceForm({ ...sourceForm, url: event.target.value })} /></Control>
+            <ToggleControl label={t("settings.egress.subscriptionProxy")} checked={sourceForm.proxyEnabled} onChange={(proxyEnabled) => setSourceForm({ ...sourceForm, proxyEnabled })} />
+            {sourceForm.proxyEnabled ? <Control label={t("settings.egress.subscriptionProxyURL")}><Input type="password" autoComplete="new-password" aria-invalid={sourceProxyInvalid} placeholder={sourceEditing?.proxyConfigured ? t("settings.egress.keepConfigured") : "http://proxy.example:8080"} value={sourceForm.proxyURL} onChange={(event) => setSourceForm({ ...sourceForm, proxyURL: event.target.value })} />{sourceProxyInvalid ? <p className="text-xs text-destructive">{t("settings.egress.invalidSubscriptionProxy")}</p> : null}</Control> : null}
             <div className="grid gap-3 sm:grid-cols-2">
               <Control label={t("settings.egress.refreshInterval")}><Input type="number" min={60} max={86400} value={sourceForm.refreshIntervalSeconds} onChange={(event) => setSourceForm({ ...sourceForm, refreshIntervalSeconds: Number(event.target.value) })} /></Control>
               <Control label={t("settings.egress.capacity")}><Input type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={sourceForm.defaultAccountCapacity || ""} onChange={(event) => setSourceForm({ ...sourceForm, defaultAccountCapacity: Number(event.target.value) })} /></Control>
             </div>
-            <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setSourceEditing(undefined)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!sourceForm.name.trim() || (!sourceEditing && !sourceForm.url.trim()) || saveSource.isPending}>{saveSource.isPending ? <Spinner /> : null}{t("common.save")}</Button></DialogFooter>
+            <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setSourceEditing(undefined)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!sourceForm.name.trim() || (!sourceEditing && !sourceForm.url.trim()) || (sourceForm.proxyEnabled && !sourceEditing?.proxyConfigured && !sourceForm.proxyURL.trim()) || sourceProxyInvalid || saveSource.isPending}>{saveSource.isPending ? <Spinner /> : null}{t("common.save")}</Button></DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
@@ -376,11 +390,13 @@ function nodeCooling(node: EgressNodeDTO): boolean {
 }
 
 function supportsFallbackScope(nodeScope: EgressScope, requestScope: EgressScope): boolean {
-  return nodeScope === requestScope || ((requestScope === "grok_console" || requestScope === "grok_web_asset") && nodeScope === "grok_web");
+  if (nodeScope === requestScope) return true;
+  if (requestScope === "grok_console" || requestScope === "grok_web_asset") return nodeScope === "grok_web";
+  return requestScope === "grok_console_asset" && (nodeScope === "grok_console" || nodeScope === "grok_web");
 }
 
 function ScopeSelect({ value, onChange, scopeLabel }: { value: EgressScope; onChange: (value: EgressScope) => void; scopeLabel: (scope: EgressScope) => string }) {
-  return <Select value={value} onValueChange={(next) => onChange(next as EgressScope)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{(["grok_build", "grok_web", "grok_console", "grok_web_asset"] as EgressScope[]).map((scope) => <SelectItem key={scope} value={scope}>{scopeLabel(scope)}</SelectItem>)}</SelectContent></Select>;
+  return <Select value={value} onValueChange={(next) => onChange(next as EgressScope)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{fallbackScopes.map((scope) => <SelectItem key={scope} value={scope}>{scopeLabel(scope)}</SelectItem>)}</SelectContent></Select>;
 }
 
 function OperationSectionHeader({ title, help, children }: { title: string; help: string; children?: ReactNode }) {
@@ -407,7 +423,7 @@ function ActionTooltip({ label, children }: { label: string; children: ReactNode
   );
 }
 
-function AutomationRow({ controlId, label, description, children }: { controlId: string; label: string; description: string; children: ReactNode }) {
+function AutomationRow({ controlId, label, description, error, children }: { controlId: string; label: string; description: string; error?: string; children: ReactNode }) {
   return (
     <div className="min-w-0 py-4">
       <div className="grid min-w-0 gap-2.5 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] sm:items-center sm:gap-8">
@@ -416,6 +432,7 @@ function AutomationRow({ controlId, label, description, children }: { controlId:
             <Label htmlFor={controlId} className="text-xs font-medium">{label}</Label>
           </div>
           <p className="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">{description}</p>
+          {error ? <p className="mt-1 text-xs text-destructive">{error}</p> : null}
         </div>
         <div className="min-w-0">{children}</div>
       </div>

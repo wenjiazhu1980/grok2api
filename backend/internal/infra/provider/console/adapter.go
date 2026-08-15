@@ -14,16 +14,20 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
+	providerstreamidle "github.com/chenyme/grok2api/backend/internal/infra/provider/streamidle"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
 type Config struct {
-	BaseURL        string
-	SessionBaseURL string
-	TimeoutSeconds int
+	BaseURL                  string
+	SessionBaseURL           string
+	TimeoutSeconds           int
+	StreamIdleTimeoutSeconds int
 }
 
 type Adapter struct {
@@ -31,15 +35,26 @@ type Adapter struct {
 	cfg    Config
 	egress *infraegress.Manager
 	cipher *security.Cipher
+	assets provider.ImageAssetStore
+	dpop   *dpopSessionManager
 }
 
-func NewAdapter(cfg Config, egress *infraegress.Manager, cipher *security.Cipher) *Adapter {
-	return &Adapter{cfg: cfg, egress: egress, cipher: cipher}
+func NewAdapter(cfg Config, egress *infraegress.Manager, cipher *security.Cipher, assets provider.ImageAssetStore) *Adapter {
+	cfg = normalizedConfig(cfg)
+	return &Adapter{cfg: cfg, egress: egress, cipher: cipher, assets: assets, dpop: newDPoPSessionManager()}
+}
+
+func normalizedConfig(cfg Config) Config {
+	if cfg.StreamIdleTimeoutSeconds <= 0 {
+		cfg.StreamIdleTimeoutSeconds = int(settingsdomain.DefaultConsoleStreamIdleTimeout.Seconds())
+	}
+	return cfg
 }
 
 func (a *Adapter) Provider() account.Provider { return account.ProviderConsole }
 
 func (a *Adapter) UpdateConfig(cfg Config) {
+	cfg = normalizedConfig(cfg)
 	a.mu.Lock()
 	a.cfg = cfg
 	a.mu.Unlock()
@@ -57,6 +72,15 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 	if _, ok := Resolve(upstreamModel); ok {
 		return QuotaMode
 	}
+	if ResolveMedia(upstreamModel, modeldomain.CapabilityImage) || ResolveMedia(upstreamModel, modeldomain.CapabilityImageEdit) {
+		return QuotaModeImage
+	}
+	if ResolveMedia(upstreamModel, modeldomain.CapabilityVideo) {
+		return QuotaModeVideo
+	}
+	if ResolveMedia(upstreamModel, modeldomain.CapabilityTTS) || ResolveMedia(upstreamModel, modeldomain.CapabilitySTT) || ResolveMedia(upstreamModel, modeldomain.CapabilityRealtime) {
+		return QuotaMode
+	}
 	return ""
 }
 
@@ -65,11 +89,7 @@ func (a *Adapter) TierOrder(string) []account.WebTier { return nil }
 func (a *Adapter) PricingModel(upstreamModel string) string { return upstreamModel }
 
 func (a *Adapter) ListModels(context.Context, account.Credential) ([]string, error) {
-	values := make([]string, 0, len(catalog))
-	for _, spec := range catalog {
-		values = append(values, spec.UpstreamModel)
-	}
-	return values, nil
+	return allModels(), nil
 }
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
@@ -78,26 +98,6 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	return marshalCredentials(values)
-}
-
-func (a *Adapter) SyncQuota(_ context.Context, credential account.Credential) (provider.QuotaSnapshot, error) {
-	now := time.Now().UTC()
-	resetAt := now.Add(DefaultQuotaWindow * time.Second)
-	return provider.QuotaSnapshot{SyncedAt: now, Windows: []account.QuotaWindow{{
-		AccountID: credential.ID, Mode: QuotaMode, Remaining: DefaultQuotaLimit, Total: DefaultQuotaLimit,
-		WindowSeconds: DefaultQuotaWindow, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceDefault, UpdatedAt: now,
-	}}}, nil
-}
-
-func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error) {
-	if mode != QuotaMode {
-		return account.QuotaWindow{}, fmt.Errorf("不支持的 Console 额度模式 %q", mode)
-	}
-	snapshot, err := a.SyncQuota(ctx, credential)
-	if err != nil {
-		return account.QuotaWindow{}, err
-	}
-	return snapshot.Windows[0], nil
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -128,28 +128,31 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 	}
 	cfg := a.config()
-	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	requestCtx, totalCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+	var idleCancel context.CancelCauseFunc
+	if request.Streaming && cfg.StreamIdleTimeoutSeconds > 0 {
+		requestCtx, idleCancel = context.WithCancelCause(requestCtx)
+	}
+	cancel := func() {
+		if idleCancel != nil {
+			idleCancel(nil)
+		}
+		totalCancel()
+	}
 	lease, err := a.egress.AcquireCredential(requestCtx, egressdomain.ScopeConsole, request.Credential)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	upstream, err := http.NewRequestWithContext(requestCtx, http.MethodPost, consoleEndpoint(cfg.BaseURL), bytes.NewReader(body))
-	if err != nil {
-		lease.Release()
-		cancel()
-		return nil, err
-	}
-	applyHeaders(upstream, token, lease)
-	if request.Streaming {
-		upstream.Header.Set("Accept", "text/event-stream")
-	}
-	response, err := lease.DoDeferredForbidden(upstream)
+	response, err := a.doDPoPRequest(requestCtx, request.Credential, token, lease, http.MethodPost, consoleEndpoint(cfg.BaseURL), body, "*/*")
 	if err != nil {
 		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
 		lease.Release()
 		cancel()
 		return nil, err
+	}
+	if request.Streaming && idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
+		response.Body = providerstreamidle.New(response.Body, time.Duration(cfg.StreamIdleTimeoutSeconds)*time.Second, idleCancel)
 	}
 	responseBodyTruncated := false
 	var rateLimit *provider.RateLimitMetadata
@@ -171,7 +174,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			cancel()
 			return nil, readErr
 		}
-		if !provider.IsDefinitiveAccountBlockBody(data) {
+		if shouldInvalidateConsoleClearance(data) {
 			lease.InvalidateClearance()
 			a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, response.StatusCode, nil)
 		}
@@ -245,6 +248,12 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	return result, nil
 }
 
+// shouldInvalidateConsoleClearance keeps account-level and protocol-level
+// rejections from being misclassified as a broken browser/egress binding.
+func shouldInvalidateConsoleClearance(body []byte) bool {
+	return !provider.IsDefinitiveAccountBlockBody(body) && !provider.IsDPoPProofRequiredBody(body)
+}
+
 func normalizeConversationError(data []byte, operation string, status int) []byte {
 	var envelope struct {
 		Error   json.RawMessage `json:"error"`
@@ -298,11 +307,7 @@ func conversationErrorType(status int, operation string) string {
 }
 
 func consoleEndpoint(baseURL string) string {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if strings.HasSuffix(baseURL, "/v1") {
-		return baseURL + "/responses"
-	}
-	return baseURL + "/v1/responses"
+	return consoleV1Endpoint(baseURL, "/responses")
 }
 
 func normalizeRateLimitResponse(response *http.Response) (bool, *provider.RateLimitMetadata, error) {

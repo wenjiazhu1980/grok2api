@@ -2,6 +2,9 @@ import { ApiError, apiDownload, apiDownloadResponse, apiEventStream, apiRequest,
 import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
 import { i18n } from "@/shared/i18n";
 import type { SortOrder } from "@/shared/lib/table-sort";
+import { createAccountTaskProgressController, type AccountTaskProgressDTO, type AccountTaskProgressPhase } from "@/features/accounts/account-task-progress";
+
+export type { AccountTaskProgressDTO } from "@/features/accounts/account-task-progress";
 
 export type AccountProvider = "grok_build" | "grok_web" | "grok_console";
 export type BuildRouteMode = "auto" | "build" | "xai";
@@ -81,6 +84,8 @@ export type AccountDTO = {
   buildSuperEntitled: boolean;
   buildRouteMode: BuildRouteMode;
   buildBotFlagged: boolean;
+  /** Numeric bot_flag_source/bfs claim when risk-flagged: 1 or 2. */
+  buildBotFlagSource?: number;
   egressNodeId?: string;
   egressAssignmentMode?: "manual" | "auto";
   modelSyncFailed?: boolean;
@@ -184,7 +189,7 @@ const accountValidator = hasShape({
   id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
   webTierSyncedAt: isOptional(isString), nsfwEnabledAt: isOptional(isString), termsAcceptedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
   enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean, cloudflareCookieConfigured: isBoolean,
-  buildSuperEntitled: isBoolean, buildRouteMode: isOneOf("auto", "build", "xai"), buildBotFlagged: isBoolean, modelSyncFailed: isOptional(isBoolean), refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
+  buildSuperEntitled: isBoolean, buildRouteMode: isOneOf("auto", "build", "xai"), buildBotFlagged: isBoolean, buildBotFlagSource: isOptional(isNumber), modelSyncFailed: isOptional(isBoolean), refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
   egressNodeId: isOptional(isString), egressAssignmentMode: isOptional(isOneOf("manual", "auto")),
   lastRefreshErrorStatus: isOptional(isNumber), lastRefreshErrorCode: isOptional(isString), lastRefreshErrorMessage: isOptional(isString), lastRefreshErrorResponse: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
@@ -219,7 +224,8 @@ type ListAccountsInput = {
   risk?: string;
   agreement?: string;
   association?: string;
-  provider: AccountProvider;
+  // 为空时返回全部 provider 的账号，用于跨 provider 的通用名单（如请求审计筛选）。
+  provider?: AccountProvider;
   sortBy?: string;
   sortOrder?: SortOrder;
 };
@@ -238,7 +244,7 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
   }
-  query.set("provider", input.provider);
+  if (input.provider) query.set("provider", input.provider);
   return apiRequest(`/api/admin/v1/accounts?${query}`, {}, decodeAccountPage);
 }
 
@@ -318,6 +324,21 @@ export function enableWebAccountNSFW(id: string): Promise<{ completed: boolean }
 export type AccountBatchResultDTO = { succeeded: number; failed: number };
 export type AccountTokenRefreshResultDTO = AccountBatchResultDTO & { skipped: number };
 
+/** 管理端 Grok Build 检测的单账号增量结果（SSE event: item）。 */
+export type BuildDetectItemDTO = {
+  id: string;
+  name: string;
+  email?: string;
+  outcome: "ok" | "invalid" | "failed";
+  reason?: string;
+  httpStatus?: number;
+};
+
+export type BuildDetectHandlers = {
+  onProgress?: (value: AccountTaskProgressDTO) => void;
+  onItem?: (item: BuildDetectItemDTO) => void;
+};
+
 export type BuildConversionResultDTO = {
   created: number;
   linked: number;
@@ -349,12 +370,6 @@ export type WebAccountScriptsInput =
   | { all: true; ids?: never; actions: WebAccountScriptActions }
   | { all?: false; ids: string[]; actions: WebAccountScriptActions };
 
-export type AccountTaskProgressDTO = {
-  completed: number;
-  total: number;
-  phase?: "importing" | "converting" | "syncing";
-};
-
 export type AccountImportResultDTO = {
   created: number;
   updated: number;
@@ -364,9 +379,15 @@ export type AccountImportResultDTO = {
 
 export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
 
-type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO> & {
+type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO & BuildDetectItemDTO> & {
   code?: string;
   message?: string;
+  outcome?: string;
+  reason?: string;
+  httpStatus?: number;
+  id?: string;
+  name?: string;
+  email?: string;
 };
 
 const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayload>("account task event", {
@@ -374,6 +395,8 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   synced: isOptional(isNumber), syncFailed: isOptional(isNumber), completed: isOptional(isNumber), total: isOptional(isNumber),
   phase: isOptional(isOneOf("importing", "converting", "syncing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
   code: isOptional(isString), message: isOptional(isString),
+  id: isOptional(isString), name: isOptional(isString), email: isOptional(isString),
+  outcome: isOptional(isOneOf("ok", "invalid", "failed")), reason: isOptional(isString), httpStatus: isOptional(isNumber),
 });
 
 function hasNumericResult(value: AccountTaskStreamPayload, fields: string[]): boolean {
@@ -383,51 +406,32 @@ function hasNumericResult(value: AccountTaskStreamPayload, fields: string[]): bo
   });
 }
 
-async function runAccountTask<T>(path: string, body: BodyInit | object | undefined, resultFields: string[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<T> {
+type AccountTaskOptions = {
+  onProgress?: (value: AccountTaskProgressDTO) => void;
+  signal?: AbortSignal;
+  phases?: readonly AccountTaskProgressPhase[];
+};
+
+const importSyncPhases = ["importing", "syncing"] as const;
+const conversionSyncPhases = ["converting", "syncing"] as const;
+
+async function runAccountTask<T>(path: string, body: BodyInit | object | undefined, resultFields: string[], options: AccountTaskOptions = {}): Promise<T> {
   let result: T | undefined;
-  let pendingProgress: AccountTaskProgressDTO | undefined;
-  let progressTimer: number | undefined;
-  let lastProgressAt = 0;
-  const flushProgress = () => {
-    if (!pendingProgress || !onProgress) return;
-    const value = pendingProgress;
-    pendingProgress = undefined;
-    lastProgressAt = performance.now();
-    onProgress(value);
-  };
-  const reportProgress = (value: AccountTaskProgressDTO) => {
-    if (pendingProgress && pendingProgress.phase !== value.phase && pendingProgress.completed === pendingProgress.total) {
-      if (progressTimer !== undefined) window.clearTimeout(progressTimer);
-      progressTimer = undefined;
-      flushProgress();
-    }
-    pendingProgress = value;
-    const delay = Math.max(0, 100 - (performance.now() - lastProgressAt));
-    if (delay === 0) {
-      if (progressTimer !== undefined) window.clearTimeout(progressTimer);
-      progressTimer = undefined;
-      flushProgress();
-    } else if (progressTimer === undefined) {
-      progressTimer = window.setTimeout(() => {
-        progressTimer = undefined;
-        flushProgress();
-      }, delay);
-    }
-  };
+  const progress = createAccountTaskProgressController(options);
   try {
     await apiEventStream(path, {
       method: "POST",
       headers: { Accept: "text/event-stream" },
       body,
-      signal,
+      signal: options.signal,
     }, decodeAccountTaskStreamPayload, ({ event, data }) => {
       if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number") {
         const phase = data.phase === "importing" || data.phase === "converting" || data.phase === "syncing" ? data.phase : undefined;
-        reportProgress({ completed: data.completed, total: data.total, phase });
+        progress.report({ completed: data.completed, total: data.total, phase });
         return;
       }
       if (event === "complete") {
-        flushProgress();
+        progress.flush();
         if (hasNumericResult(data, resultFields)) result = data as T;
         return;
       }
@@ -437,8 +441,7 @@ async function runAccountTask<T>(path: string, body: BodyInit | object | undefin
       }
     });
   } finally {
-    if (progressTimer !== undefined) window.clearTimeout(progressTimer);
-    flushProgress();
+    progress.dispose();
   }
   if (!result) {
     throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
@@ -447,49 +450,103 @@ async function runAccountTask<T>(path: string, body: BodyInit | object | undefin
 }
 
 export function refreshAllAccountBilling(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/refresh-billing", undefined, ["succeeded", "failed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/refresh-billing", undefined, ["succeeded", "failed"], { onProgress, signal });
+}
+
+export type DetectBuildAccountsInput =
+  | { all: true; ids?: never }
+  | { all?: false; ids: string[] };
+
+export function detectBuildAccounts(input: DetectBuildAccountsInput, handlers?: BuildDetectHandlers | ((value: AccountTaskProgressDTO) => void), signal?: AbortSignal): Promise<AccountBatchResultDTO> {
+  const body = input.all ? { provider: "grok_build" as const, all: true } : { provider: "grok_build" as const, ids: input.ids };
+  const resolved: BuildDetectHandlers = typeof handlers === "function" ? { onProgress: handlers } : (handlers ?? {});
+  return runDetectBuildAccountsTask(body, resolved, signal);
+}
+
+async function runDetectBuildAccountsTask(body: object, handlers: BuildDetectHandlers, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
+  let result: AccountBatchResultDTO | undefined;
+  const progress = createAccountTaskProgressController({ onProgress: handlers.onProgress });
+  try {
+    await apiEventStream("/api/admin/v1/accounts/detect", {
+      method: "POST",
+      headers: { Accept: "text/event-stream" },
+      body,
+      signal,
+    }, decodeAccountTaskStreamPayload, ({ event, data }) => {
+      if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number") {
+        progress.report({ completed: data.completed, total: data.total });
+        return;
+      }
+      if (event === "item" && typeof data.id === "string" && typeof data.name === "string" && (data.outcome === "ok" || data.outcome === "invalid" || data.outcome === "failed")) {
+        handlers.onItem?.({
+          id: data.id,
+          name: data.name,
+          email: data.email,
+          outcome: data.outcome,
+          reason: data.reason,
+          httpStatus: data.httpStatus,
+        });
+        return;
+      }
+      if (event === "complete") {
+        progress.flush();
+        if (hasNumericResult(data, ["succeeded", "failed"])) result = data as AccountBatchResultDTO;
+        return;
+      }
+      if (event === "error") {
+        const code = data.code ?? "accountDetectFailed";
+        throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (data.message ?? i18n.t("apiErrors.requestFailed")));
+      }
+    });
+  } finally {
+    progress.dispose();
+  }
+  if (!result) {
+    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+  }
+  return result;
 }
 
 export function refreshAllAccountTokens(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountTokenRefreshResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/refresh-tokens", undefined, ["succeeded", "failed", "skipped"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/refresh-tokens", undefined, ["succeeded", "failed", "skipped"], { onProgress, signal });
 }
 
 export function refreshAllWebAccountQuotas(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/refresh-quotas", undefined, ["succeeded", "failed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/web/refresh-quotas", undefined, ["succeeded", "failed"], { onProgress, signal });
 }
 
 export function refreshAllConsoleAccountQuotas(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/console/refresh-quotas", undefined, ["succeeded", "failed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/console/refresh-quotas", undefined, ["succeeded", "failed"], { onProgress, signal });
 }
 
 export function convertWebAccountsToBuild(input: BuildConversionInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<BuildConversionResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/convert-to-build", input, ["created", "linked", "skipped", "failed", "synced", "syncFailed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/web/convert-to-build", input, ["created", "linked", "skipped", "failed", "synced", "syncFailed"], { onProgress, signal, phases: conversionSyncPhases });
 }
 
 export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<WebConsoleSyncResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], { onProgress, signal });
 }
 
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function importWebAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function importConsoleAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "synced", "syncFailed"], { onProgress, signal, phases: importSyncPhases });
 }
 
 export function refreshAccountQuota(id: string): Promise<AccountDTO> {
