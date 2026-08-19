@@ -191,8 +191,9 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 
 	adapter := &failoverAdapter{
 		firstID: first.ID, failureStatus: http.StatusPaymentRequired,
-		failureBody:   `{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}`,
-		failureHeader: http.Header{"X-Should-Retry": {"false"}},
+		failureBody:     `{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}`,
+		failureHeader:   http.Header{"X-Should-Retry": {"false"}},
+		reasoningEffort: "high",
 	}
 	registry := provider.NewRegistry(adapter)
 	cipher := testCipher(t)
@@ -202,7 +203,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	clientService := clientkeyapp.NewService(nil, nil, nil, 60, 4, nil)
 	selector := NewSelector(accountRepo, concurrency, sticky, registry, time.Hour, time.Second, time.Minute)
 	service := NewService(modelRepo, auditRepo, accountService, clientService, registry, selector, responseRepo, 3)
-	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "claude-session", GrokTurnIndex: "3"})
+	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test","reasoning":{"effort":"high"}}`), PromptCacheSeed: "claude-session", GrokTurnIndex: "3"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +238,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("observed account = %#v, err = %v", observedAccount, err)
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
-	if err != nil || total != 1 || logs[0].AccountID == nil || *logs[0].AccountID != second.ID || logs[0].ClientKeyName != "test-key" || logs[0].ModelPublicID != "grok-test" || logs[0].ModelUpstreamModel != "Build/grok-test" || logs[0].AccountName != "second" || logs[0].CachedInputTokens != 80 || logs[0].UsageSource != audit.UsageSourceUpstream || logs[0].StatusCode != http.StatusOK || logs[0].AttemptCount != 1 {
+	if err != nil || total != 1 || logs[0].AccountID == nil || *logs[0].AccountID != second.ID || logs[0].ClientKeyName != "test-key" || logs[0].ModelPublicID != "grok-test" || logs[0].ModelUpstreamModel != "Build/grok-test" || logs[0].ReasoningEffort != "high" || logs[0].AccountName != "second" || logs[0].CachedInputTokens != 80 || logs[0].UsageSource != audit.UsageSourceUpstream || logs[0].StatusCode != http.StatusOK || logs[0].AttemptCount != 1 {
 		t.Fatalf("audit = %#v, %d, %v", logs, total, err)
 	}
 	detail, err := auditRepo.Get(ctx, logs[0].ID)
@@ -378,7 +379,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	selector.accounts = healthBlocker
 	finalized := make(chan struct{})
 	go func() {
-		interrupted.Finalize(Usage{}, "", "upstream_stream_incomplete")
+		interrupted.Finalize(Usage{}, "", "upstream_stream_idle_timeout")
 		close(finalized)
 	}()
 	select {
@@ -401,8 +402,12 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 	_ = interrupted.Body.Close()
 	interruptedAccount, err := accountRepo.Get(ctx, adapter.attempts[0])
-	if err != nil || interruptedAccount.FailureCount != 0 || interruptedAccount.CooldownUntil == nil {
+	if err != nil || interruptedAccount.FailureCount != 1 || interruptedAccount.CooldownUntil == nil {
 		t.Fatalf("interrupted account health = %#v, err=%v", interruptedAccount, err)
+	}
+	remaining := time.Until(*interruptedAccount.CooldownUntil)
+	if remaining < 23*time.Hour || remaining > 24*time.Hour+time.Minute {
+		t.Fatalf("idle stream cooldown = %s, want about 24h", remaining)
 	}
 }
 
@@ -2597,6 +2602,7 @@ type failoverAdapter struct {
 	lastPromptCacheKey     string
 	lastReasoningReplayKey string
 	lastGrokTurnIndex      string
+	reasoningEffort        string
 	forwardedModels        []string
 	resourceStatus         int
 	transportErrorIDs      map[uint64]error
@@ -4147,6 +4153,9 @@ func (a *failoverAdapter) Definition() provider.Definition {
 	}
 }
 func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	if request.NormalizedMetadata != nil {
+		request.NormalizedMetadata.ReasoningEffort = a.reasoningEffort
+	}
 	a.mu.Lock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.forwardedModels = append(a.forwardedModels, request.Model)
@@ -4268,6 +4277,7 @@ func TestAuditRequestSucceeded(t *testing.T) {
 		{name: "2xx without error succeeds", statusCode: 200, errorCode: "", want: true},
 		{name: "2xx stream interruption fails", statusCode: 200, errorCode: "upstream_stream_interrupted", want: false},
 		{name: "2xx stream incomplete fails", statusCode: 200, errorCode: "upstream_stream_incomplete", want: false},
+		{name: "2xx stream idle timeout fails", statusCode: 200, errorCode: "upstream_stream_idle_timeout", want: false},
 		{name: "any 2xx error fails", statusCode: 201, errorCode: "stream_interrupted", want: false},
 		{name: "4xx fails", statusCode: 404, errorCode: "upstream_error", want: false},
 		{name: "5xx fails", statusCode: 502, errorCode: "upstream_server_error", want: false},
@@ -4278,5 +4288,35 @@ func TestAuditRequestSucceeded(t *testing.T) {
 				t.Fatalf("auditRequestSucceeded(%d, %q) = %t, want %t", tc.statusCode, tc.errorCode, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestIsUpstreamStreamFailureIncludesIdleTimeout(t *testing.T) {
+	if !isUpstreamStreamFailure("upstream_stream_idle_timeout") {
+		t.Fatal("idle timeout must cool the hanging account")
+	}
+	if !isUpstreamStreamFailure("upstream_stream_interrupted") || !isUpstreamStreamFailure("upstream_stream_incomplete") {
+		t.Fatal("existing stream-failure codes must stay classified")
+	}
+	if isUpstreamStreamFailure("") || isUpstreamStreamFailure("quality_degraded") {
+		t.Fatal("non-stream codes must not look like mid-stream failures")
+	}
+}
+
+func TestStreamFailureHealthPenaltyOnlyLongCoolsTrulyEmptyIdle(t *testing.T) {
+	t.Parallel()
+	status, cooldown := streamFailureHealthPenalty("upstream_stream_idle_timeout", Usage{})
+	if status != http.StatusGatewayTimeout || cooldown != qualityIdleAccountCooldown {
+		t.Fatalf("empty idle penalty = (%d, %s)", status, cooldown)
+	}
+	for _, usage := range []Usage{
+		{OutputObserved: true},
+		{OutputTokens: 1},
+		{ReasoningTokens: 1},
+	} {
+		status, cooldown = streamFailureHealthPenalty("upstream_stream_idle_timeout", usage)
+		if status != 0 || cooldown != 0 {
+			t.Fatalf("non-empty idle usage %#v received long penalty (%d, %s)", usage, status, cooldown)
+		}
 	}
 }
