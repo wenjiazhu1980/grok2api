@@ -29,6 +29,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -270,6 +271,42 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 	if _, err := responseRepo.Get(ctx, "resp-compact", clientKey.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("compaction response ownership err = %v", err)
+	}
+
+	// Grok TUI compaction is a normal Responses request on the wire. It skips
+	// the quality hold and is labeled compaction only in the audit record, so
+	// Provider routing and stored-response ownership must remain intact.
+	service.UpdateQualityRetry(QualityRetryRuntime{
+		Enabled: true, MaxAttempts: 2, MinOutputTokens: 32,
+		OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+	})
+	adapter.resetAttempts()
+	tuiCompacted, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-tui-compact", ClientKey: clientKey, PublicModel: "grok-test", PromptCacheSeed: "tui-session",
+		Body: []byte(`{"model":"grok-test","stream":true,"input":[{"role":"user","content":"` + tuiCompactionPrompt + `"}]}`), Streaming: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuiBody, err := io.ReadAll(tuiCompacted.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(tuiBody) != "ok" {
+		t.Fatalf("TUI compaction body = %q", tuiBody)
+	}
+	tuiCompacted.MarkFirstToken()
+	tuiCompacted.Finalize(Usage{}, "resp-tui-compact", "")
+	_ = tuiCompacted.Body.Close()
+	if len(adapter.attempts) != 1 || adapter.lastOperation != string(audit.OperationResponses) {
+		t.Fatalf("TUI compaction attempts = %#v, Provider operation = %q", adapter.attempts, adapter.lastOperation)
+	}
+	logs, total, err = auditRepo.List(ctx, 0, 10)
+	if err != nil || total != 3 || logs[0].Operation != audit.OperationCompaction {
+		t.Fatalf("TUI compaction audit = %#v, total=%d, err=%v", logs, total, err)
+	}
+	if ownership, err := responseRepo.Get(ctx, "resp-tui-compact", clientKey.ID, time.Now().UTC()); err != nil || ownership.AccountID != second.ID {
+		t.Fatalf("TUI compaction ownership = %#v, err=%v", ownership, err)
 	}
 
 	adapter.resetAttempts()
@@ -2386,7 +2423,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	service.UpdateMaxAttempts(3)
 	attemptsBeforeFailure := len(adapter.Attempts())
 	adapter.FailWithEgress(infraegress.NewManager(relational.NewEgressRepository(database), testCipher(t)))
-	if _, err := service.GenerateImage(ctx, ImageGenerationInput{
+	failureCtx := requestmeta.WithClientIP(ctx, "203.0.113.51")
+	if _, err := service.GenerateImage(failureCtx, ImageGenerationInput{
 		RequestID: "req-image-failed", ClientKey: key, PublicModel: "grok-imagine-image",
 		Prompt: "test", Count: 1, Resolution: "1k", ResponseFormat: "url",
 	}); err == nil {
@@ -2400,7 +2438,7 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 		t.Fatalf("failure audit logs=%#v total=%d err=%v", logs, total, err)
 	}
 	failureAudit := logs[0]
-	if failureAudit.RequestID != "req-image-failed" || failureAudit.StatusCode != http.StatusBadGateway || failureAudit.ErrorCode != "upstream_unavailable" || failureAudit.MediaOutputImages != 0 || failureAudit.EstimatedCostInUSDTicks != 0 || failureAudit.EgressMode != audit.EgressModeDirect || failureAudit.EgressScope != string(egressdomain.ScopeWeb) || failureAudit.EgressNodeName != "direct" {
+	if failureAudit.ClientIP != "203.0.113.51" || failureAudit.RequestID != "req-image-failed" || failureAudit.StatusCode != http.StatusBadGateway || failureAudit.ErrorCode != "upstream_unavailable" || failureAudit.MediaOutputImages != 0 || failureAudit.EstimatedCostInUSDTicks != 0 || failureAudit.EgressMode != audit.EgressModeDirect || failureAudit.EgressScope != string(egressdomain.ScopeWeb) || failureAudit.EgressNodeName != "direct" {
 		t.Fatalf("failure audit = %#v", failureAudit)
 	}
 	updatedKey, err := keyRepo.Get(ctx, key.ID)
@@ -2602,6 +2640,7 @@ type failoverAdapter struct {
 	lastPromptCacheKey     string
 	lastReasoningReplayKey string
 	lastGrokTurnIndex      string
+	lastOperation          string
 	reasoningEffort        string
 	forwardedModels        []string
 	resourceStatus         int
@@ -3311,7 +3350,8 @@ func TestGatewayExhausted429PreservesLastBodyInFailure(t *testing.T) {
 	audits := &attemptCapturingAudit{inner: auditRepo}
 	service := NewService(modelRepo, audits, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
 
-	_, err = service.CreateResponse(ctx, Input{
+	requestCtx := requestmeta.WithClientIP(ctx, "2001:db8::42")
+	_, err = service.CreateResponse(requestCtx, Input{
 		RequestID: "req-body-429", ClientKey: clientKey, PublicModel: "grok-body",
 		Body: []byte(`{"model":"grok-body","input":"hello"}`),
 	})
@@ -3321,6 +3361,9 @@ func TestGatewayExhausted429PreservesLastBodyInFailure(t *testing.T) {
 	}
 	if upstreamFailure.HTTPStatus != http.StatusTooManyRequests {
 		t.Fatalf("status = %d", upstreamFailure.HTTPStatus)
+	}
+	if audits.last.ClientIP != "2001:db8::42" {
+		t.Fatalf("client IP = %q", audits.last.ClientIP)
 	}
 	if len(audits.last.Attempts) < 2 {
 		t.Fatalf("attempts = %#v", audits.last.Attempts)
@@ -4164,6 +4207,7 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	a.lastPromptCacheKey = request.PromptCacheKey
 	a.lastReasoningReplayKey = request.ReasoningReplayKey
 	a.lastGrokTurnIndex = request.GrokTurnIndex
+	a.lastOperation = request.Operation
 	resourceStatus := a.resourceStatus
 	transportErr := a.transportErrorIDs[request.Credential.ID]
 	a.mu.Unlock()
@@ -4204,6 +4248,7 @@ func (a *failoverAdapter) resetAttempts() {
 	a.lastPromptCacheKey = ""
 	a.lastReasoningReplayKey = ""
 	a.lastGrokTurnIndex = ""
+	a.lastOperation = ""
 }
 
 func (a *failoverAdapter) ForwardedModels() []string {
